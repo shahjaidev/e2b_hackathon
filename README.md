@@ -1,3 +1,4 @@
+
 # 🤖 CSV Analyzer AI Assistant
 
 An intelligent AI assistant that analyzes CSV files using **Gemini AI** for natural language understanding and **E2B** for secure Python code execution in sandboxed environments.
@@ -226,4 +227,10 @@ Contributions welcome! Please open an issue or submit a pull request.
 ---
 
 Made with ❤️ using Groq AI and E2B
+
+# e2b_hackathon
+# Team_Members : 
+Shaheriyar Zahed
+Vignesh Gunda
+Jaidev Shah
 
