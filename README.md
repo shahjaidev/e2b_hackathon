@@ -8,6 +8,7 @@ An intelligent AI assistant that analyzes CSV files using **Gemini AI** for natu
 - 💬 **Natural Language Queries**: Ask questions in plain English about your data
 - 🐍 **Python Code Execution**: AI generates and executes Python code in E2B sandbox
 - 📈 **Automatic Visualizations**: Creates charts and graphs using matplotlib
+- 🔍 **Deep Web Research**: Use E2B MCP sandbox with Exa for comprehensive web research
 - 🎨 **Modern UI**: Beautiful, responsive React frontend
 - 🔒 **Secure**: Code runs in isolated E2B sandboxes
 
@@ -45,7 +46,10 @@ Create a `.env` file in the root directory:
 ```bash
 E2B_API_KEY=your_e2b_api_key_here
 GROQ_API_KEY=your_groq_api_key_here
+EXA_API_KEY=your_exa_api_key_here  # Optional: For web research feature
 ```
+
+**Note**: The `EXA_API_KEY` is optional and only needed if you want to use the web research feature. Get your Exa API key from [Exa AI](https://exa.ai/).
 
 3. **Install frontend dependencies**
 
@@ -173,6 +177,43 @@ e2b_hackathon/
 - Verify E2B API key is valid
 - Check internet connection
 - Ensure CSV is properly formatted
+
+## 🔍 Web Research Feature
+
+The application now supports deep web research using E2B MCP (Model Context Protocol) sandboxes with Exa for web search.
+
+### Setup
+
+1. Get an Exa API key from [Exa AI](https://exa.ai/)
+2. Add it to your `.env` file:
+   ```bash
+   EXA_API_KEY=your_exa_api_key_here
+   ```
+
+### Usage
+
+Send a POST request to `/api/research`:
+
+```bash
+curl -X POST http://localhost:5000/api/research \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What happened last week in AI?",
+    "session_id": "my_research_session"
+  }'
+```
+
+The research endpoint:
+- Creates an E2B sandbox with Exa MCP server enabled
+- Uses Groq AI (moonshotai/kimi-k2-instruct-0905) with MCP tools
+- Performs comprehensive web searches using Exa
+- Returns detailed research results with sources
+
+### Example Research Queries
+
+- "What are the latest developments in quantum computing?"
+- "Find recent research papers about large language models"
+- "What happened in the tech industry this month?"
 
 ## 📝 License
 
