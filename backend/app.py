@@ -97,9 +97,18 @@ def cleanup_sandbox(session_id):
     if session_id in uploaded_files:
         del uploaded_files[session_id]
 
+def get_file_type(filename):
+    """Determine file type from extension"""
+    filename_lower = filename.lower()
+    if filename_lower.endswith('.csv'):
+        return 'csv'
+    elif filename_lower.endswith(('.xls', '.xlsx', '.xlsm')):
+        return 'excel'
+    return None
+
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
-    """Upload CSV file to sandbox"""
+    """Upload CSV, XLS, or Excel file to sandbox"""
     try:
         print(f"Upload request received")
         if 'file' not in request.files:
@@ -112,8 +121,9 @@ def upload_file():
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
         
-        if not file.filename.endswith('.csv'):
-            return jsonify({'error': 'Only CSV files are allowed'}), 400
+        file_type = get_file_type(file.filename)
+        if not file_type:
+            return jsonify({'error': 'Only CSV, XLS, and Excel (.xlsx, .xlsm) files are allowed'}), 400
         
         # Save file locally
         print("Saving file locally...")
@@ -131,9 +141,12 @@ def upload_file():
             sandbox_path = sbx.files.write(f"/home/user/{file.filename}", f)
         print(f"File uploaded to sandbox: {sandbox_path.path}")
         
-        # Analyze CSV to get column info (optimized for large files)
-        print("Running analysis code to extract column info...")
-        analysis_code = f"""
+        # Analyze file to get column info (optimized for large files)
+        print(f"Running analysis code to extract column info for {file_type} file...")
+        
+        # Generate appropriate analysis code based on file type
+        if file_type == 'csv':
+            analysis_code = f"""
 import pandas as pd
 import json
 # Read only first few rows to get structure quickly
@@ -150,6 +163,89 @@ columns_info = {{
     'dtypes': df.dtypes.astype(str).to_dict(),
     'sample': df.head(3).to_dict(orient='records')
 }}
+print(json.dumps(columns_info))
+"""
+        else:  # excel
+            analysis_code = f"""
+import pandas as pd
+import json
+
+try:
+    # Get all sheet names
+    xl_file = pd.ExcelFile("{sandbox_path.path}")
+    sheet_names = xl_file.sheet_names
+except Exception as e:
+    # If Excel reading fails, return error info
+    columns_info = {{
+        'columns': [],
+        'shape': [0, 0],
+        'dtypes': {{}},
+        'sample': [],
+        'error': f'Failed to read Excel file: {{str(e)}}',
+        'sheets': {{}},
+        'sheet_names': [],
+        'default_sheet': None
+    }}
+    print(json.dumps(columns_info))
+    exit(0)
+
+# Analyze each sheet
+sheets_info = {{}}
+
+# Analyze each sheet
+sheets_info = {{}}
+for sheet_name in sheet_names:
+    try:
+        # Read only first few rows to get structure quickly
+        df = pd.read_excel("{sandbox_path.path}", sheet_name=sheet_name, nrows=100)
+        # Get row count efficiently
+        try:
+            # For Excel files, read the full sheet to get accurate row count
+            df_full = pd.read_excel("{sandbox_path.path}", sheet_name=sheet_name)
+            total_rows = len(df_full)
+        except:
+            total_rows = len(df)
+        
+        sheets_info[sheet_name] = {{
+            'columns': list(df.columns),
+            'shape': [total_rows, len(df.columns)],
+            'dtypes': df.dtypes.astype(str).to_dict(),
+            'sample': df.head(3).to_dict(orient='records')
+        }}
+    except Exception as e:
+        sheets_info[sheet_name] = {{
+            'columns': [],
+            'shape': [0, 0],
+            'dtypes': {{}},
+            'sample': [],
+            'error': str(e)
+        }}
+
+# If only one sheet, also include it at the top level for backward compatibility
+if len(sheet_names) == 1:
+    default_sheet = sheet_names[0]
+    columns_info = {{
+        'columns': sheets_info[default_sheet]['columns'],
+        'shape': sheets_info[default_sheet]['shape'],
+        'dtypes': sheets_info[default_sheet]['dtypes'],
+        'sample': sheets_info[default_sheet]['sample'],
+        'sheets': sheets_info,
+        'sheet_names': sheet_names,
+        'default_sheet': default_sheet
+    }}
+else:
+    # For multiple sheets, use the first sheet as default but include all sheets info
+    default_sheet = sheet_names[0]
+    columns_info = {{
+        'columns': sheets_info[default_sheet]['columns'],
+        'shape': sheets_info[default_sheet]['shape'],
+        'dtypes': sheets_info[default_sheet]['dtypes'],
+        'sample': sheets_info[default_sheet]['sample'],
+        'sheets': sheets_info,
+        'sheet_names': sheet_names,
+        'default_sheet': default_sheet
+    }}
+
 print(json.dumps(columns_info))
 """
         
@@ -170,7 +266,7 @@ print(json.dumps(columns_info))
                     'sample': []
                 },
                 'session_id': session_id,
-                'warning': 'Could not analyze CSV structure automatically'
+                'warning': f'Could not analyze {file_type.upper()} file structure automatically'
             })
         print(f"Analysis code executed. Results: {len(result.results) if result.results else 0} results")
         
@@ -246,6 +342,7 @@ print(json.dumps(columns_info))
                 'filename': file.filename,
                 'sandbox_path': sandbox_path.path,
                 'local_path': str(filepath),
+                'file_type': file_type,
                 'columns_info': columns_info
             }
             
@@ -267,71 +364,88 @@ print(json.dumps(columns_info))
 def determine_query_type_with_llm(message, has_csv_data=False, csv_columns=None):
     """Use LLM to determine if query needs CSV analysis, web search, or both"""
     try:
-        # Build context for LLM
-        context = f"""User query: "{message}"
+        # Simple, clear prompt for Groq to detect intent
+        prompt = f"""Analyze this user query and determine what action is needed:
 
-Available capabilities:
-1. CSV Data Analysis: Analyze uploaded CSV files, generate statistics, create visualizations
-2. Web Research: Search the web for current information, news, facts, and research
+User query: "{message}"
+
+Available actions:
+1. csv_only - Query is EXPLICITLY asking to analyze CSV data (e.g., "show statistics", "analyze the data", "what's in the CSV")
+2. web_search_only - Query asks for research, information, facts, news, or anything NOT in CSV data (e.g., "research X", "find information about Y", "what is Z", "tell me about")
+3. both - Query EXPLICITLY needs both CSV analysis AND web research
+4. needs_csv - Query EXPLICITLY asks to analyze a CSV file but none exists
 
 """
         
         if has_csv_data and csv_columns:
-            context += f"""CSV file is available with columns: {', '.join(csv_columns)}
+            prompt += f"""A CSV file IS available with columns: {', '.join(csv_columns)}
 
-You can analyze this CSV data OR search the web, OR do both if the query requires it.
+IMPORTANT: If the query asks to "research", "search", "find information", or asks about topics/companies/facts NOT in the CSV, use web_search_only.
+Only use csv_only if the query is clearly about analyzing the uploaded CSV data.
 """
         else:
-            context += "No CSV file is currently uploaded. You can only perform web research.\n"
+            prompt += """NO CSV file is uploaded.
+
+IMPORTANT: If the user asks ANY question (research, information, facts, companies, news, etc.), respond with web_search_only.
+Only use needs_csv if the query EXPLICITLY asks to analyze a CSV file that doesn't exist.
+"""
         
-        context += """
-Based on the user's query, determine what action(s) are needed:
-- "csv_only": Query is about analyzing the CSV data
-- "web_search_only": Query requires web search (no CSV analysis needed)
-- "both": Query needs both CSV analysis AND web research
-- "needs_csv": Query seems to expect CSV data but none is uploaded
+        prompt += """
+Respond with ONLY one word: csv_only, web_search_only, both, or needs_csv"""
 
-Respond with ONLY one of these exact strings: csv_only, web_search_only, both, or needs_csv"""
-
-        # Call LLM to determine intent
+        # Call Groq to determine intent
         response = groq_client.chat.completions.create(
             model="qwen/qwen3-32b",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an intelligent routing assistant. Analyze user queries and determine what capabilities are needed. Respond with only the action type: csv_only, web_search_only, both, or needs_csv"
+                    "content": "You are a query router. Analyze the user's query and respond with ONLY one word: csv_only, web_search_only, both, or needs_csv. If the query mentions research, search, or asks for information, use web_search_only."
                 },
                 {
                     "role": "user",
-                    "content": context
+                    "content": prompt
                 }
             ],
             temperature=0.1,
-            max_tokens=50
+            max_tokens=20
         )
         
         query_type = response.choices[0].message.content.strip().lower()
         
-        # Validate and normalize response
+        # Extract just the type if LLM added extra text
         valid_types = ['csv_only', 'web_search_only', 'both', 'needs_csv']
-        if query_type in valid_types:
-            return query_type
+        for valid_type in valid_types:
+            if valid_type in query_type:
+                query_type = valid_type
+                break
         
-        # Fallback logic if LLM returns something unexpected
-        if 'csv' in query_type and 'web' in query_type:
-            return 'both'
-        elif 'csv' in query_type:
-            return 'csv_only' if has_csv_data else 'needs_csv'
-        elif 'web' in query_type or 'search' in query_type:
+        # Safety override: if no CSV and query contains research keywords, force web_search_only
+        if not has_csv_data:
+            research_keywords = ['research', 'search', 'find', 'look up', 'tell me', 'what is', 'who is', 'information about']
+            message_lower = message.lower()
+            if any(keyword in message_lower for keyword in research_keywords):
+                if query_type != 'web_search_only':
+                    print(f"Safety override: forcing web_search_only for research query without CSV")
+                    return 'web_search_only'
+        
+        # Safety override: if query_type is needs_csv but no CSV, default to web_search_only
+        if query_type == 'needs_csv' and not has_csv_data:
+            print(f"Safety override: needs_csv without CSV, defaulting to web_search_only")
             return 'web_search_only'
-        else:
-            # Default: if CSV exists, try CSV analysis; otherwise web search
-            return 'csv_only' if has_csv_data else 'web_search_only'
+        
+        return query_type if query_type in valid_types else ('web_search_only' if not has_csv_data else 'csv_only')
             
     except Exception as e:
         print(f"Error in LLM-based query type determination: {e}")
-        # Fallback: if CSV exists, default to CSV analysis
-        return 'csv_only' if has_csv_data else 'web_search_only'
+        # Fallback: if no CSV, always allow web search
+        if not has_csv_data:
+            return 'web_search_only'
+        # If CSV exists, check for research keywords
+        research_keywords = ['research', 'search', 'find', 'look up', 'tell me', 'what is']
+        message_lower = message.lower()
+        if any(keyword in message_lower for keyword in research_keywords):
+            return 'web_search_only'
+        return 'csv_only'
 
 def perform_web_research(query, research_session_id):
     """Perform web research using E2B MCP sandbox"""
@@ -348,8 +462,7 @@ def perform_web_research(query, research_session_id):
                         "exa": {
                             "apiKey": exa_api_key
                         }
-                    },
-                    timeout_ms=600_000
+                    }
                 )
                 research_sandboxes[research_session_id] = research_sandbox
             except Exception as e:
@@ -439,7 +552,7 @@ def chat():
         
         print(f"Chat request - session_id: {session_id}, message: {message[:100]}")
         
-        # Check if CSV data is available
+        # Check if data file is available
         has_csv = session_id in uploaded_files
         csv_columns = None
         file_info = None
@@ -453,11 +566,10 @@ def chat():
         print(f"Query type determined by LLM: {query_type}")
         
         # Handle different query types
+        # If needs_csv but no CSV, default to web_search_only (allow any query without CSV)
         if query_type == 'needs_csv' and not has_csv:
-            return jsonify({
-                'error': 'Please upload a CSV file first, or ask a web search question.',
-                'session_id': session_id
-            }), 400
+            print(f"Overriding needs_csv to web_search_only (no CSV uploaded, allowing web search)")
+            query_type = 'web_search_only'
         
         # Perform web search if needed
         web_research_result = None
@@ -470,6 +582,7 @@ def chat():
                 print(f"Web research error: {web_research_error}")
                 if query_type == 'web_search_only':
                     return jsonify({
+                        'response': f'Web research failed: {web_research_error}. Please check that EXA_API_KEY is configured in your .env file.',
                         'error': web_research_error,
                         'has_research': False
                     }), 500
@@ -487,7 +600,7 @@ def chat():
             print(f"Performing CSV analysis for query: {message[:100]}")
             if not has_csv:
                 return jsonify({
-                    'error': 'Please upload a CSV file first',
+                    'error': 'Please upload a data file (CSV, XLS, or Excel) first',
                     'session_id': session_id
                 }), 400
             
@@ -499,20 +612,66 @@ def chat():
                 columns_info = file_info.get('columns_info', {})
                 columns_list = columns_info.get('columns', [])
                 
-                # If both CSV and web search, incorporate web research context
+                # If both data file and web search, incorporate web research context
                 context_note = ""
                 if query_type == 'both' and web_research_result:
-                    context_note = f"\n\nIMPORTANT: The user also asked for web research. Here's what was found:\n{web_research_result}\n\nYou can use this context to enhance your analysis, but focus on analyzing the CSV data."
+                    context_note = f"\n\nIMPORTANT: The user also asked for web research. Here's what was found:\n{web_research_result}\n\nYou can use this context to enhance your analysis, but focus on analyzing the data file."
                 
-                system_prompt = f"""You are a data analysis assistant. A CSV file has been uploaded with the following information:
-- Filename: {file_info['filename']}
+                file_type = file_info.get('file_type', 'csv')
+                file_type_name = 'Excel' if file_type == 'excel' else 'CSV'
+                filename = file_info['filename']
+                
+                # Build sheet information for Excel files
+                sheet_info_text = ""
+                if file_type == 'excel':
+                    sheet_names = columns_info.get('sheet_names', [])
+                    sheets_info = columns_info.get('sheets', {})
+                    
+                    if sheet_names and len(sheet_names) > 1:
+                        # Multiple sheets - provide detailed information
+                        sheet_info_text = f"\n\nIMPORTANT: This Excel file contains {len(sheet_names)} sheets:\n"
+                        for sheet_name in sheet_names:
+                            sheet_data = sheets_info.get(sheet_name, {})
+                            sheet_cols = sheet_data.get('columns', [])
+                            sheet_shape = sheet_data.get('shape', [0, 0])
+                            sheet_info_text += f"- Sheet '{sheet_name}': {len(sheet_cols)} columns ({', '.join(sheet_cols[:5])}{'...' if len(sheet_cols) > 5 else ''}), {sheet_shape[0]} rows\n"
+                        
+                        sheet_info_text += f"\nCRITICAL: You MUST choose the appropriate sheet based on the user's query. Analyze the query to determine which sheet contains the relevant data.\n"
+                        sheet_names_quoted = ', '.join([f"'{s}'" for s in sheet_names])
+                        sheet_info_text += f"Available sheets: {sheet_names_quoted}\n"
+                        file_path = file_info['sandbox_path']
+                        sheet_info_text += f"To load a specific sheet, use: df = pd.read_excel(\"{file_path}\", sheet_name='SHEET_NAME')\n"
+                        sheet_info_text += f"If the user's query doesn't specify a sheet, intelligently choose the most relevant one based on:\n"
+                        sheet_info_text += f"  1. Column names that match the query topic\n"
+                        sheet_info_text += f"  2. Sheet names that match keywords in the query\n"
+                        sheet_info_text += f"  3. The sheet with the most relevant data structure\n"
+                        sheet_info_text += f"If unsure, you can load multiple sheets and compare, or ask the user to clarify.\n"
+                    elif sheet_names and len(sheet_names) == 1:
+                        # Single sheet - just mention it
+                        sheet_info_text = f"\n\nThis Excel file has one sheet: '{sheet_names[0]}'\n"
+                
+                # Determine the correct pandas function to use
+                if file_type == 'excel':
+                    if columns_info.get('sheet_names') and len(columns_info.get('sheet_names', [])) > 1:
+                        # Multiple sheets - use sheet_name parameter
+                        default_sheet = columns_info.get('default_sheet', columns_info.get('sheet_names', [''])[0])
+                        load_code = f"df = pd.read_excel(\"{file_info['sandbox_path']}\", sheet_name='{default_sheet}')  # Change sheet_name based on user's query"
+                    else:
+                        load_code = f'df = pd.read_excel("{file_info["sandbox_path"]}")'
+                else:
+                    load_code = f'df = pd.read_csv("{file_info["sandbox_path"]}")'
+                
+                system_prompt = f"""You are a data analysis assistant. A {file_type_name} file has been uploaded with the following information:
+- Filename: {filename}
 - Path in sandbox: {file_info['sandbox_path']}
+- File type: {file_type_name} ({file_type})
 - Columns: {', '.join(columns_list)}
 - Shape: {columns_info.get('shape', 'Unknown')}
-{context_note}
+{sheet_info_text}{context_note}
 
 When the user asks for analysis, generate Python code to:
-1. Load the CSV using pandas from the path: {file_info['sandbox_path']}
+1. Load the data file using pandas. The file is a {file_type_name} file, so use:
+   {load_code}
 2. Perform the requested analysis
 3. CRITICAL: Always convert results to strings before printing. For example:
    - For column names: print(list(df.columns)) or print(', '.join(df.columns))
@@ -658,8 +817,14 @@ Provide a concise 2-3 sentence explanation of the analysis and findings."""
         
         # Combine results based on query type
         if query_type == 'web_search_only':
+            if not web_research_result:
+                return jsonify({
+                    'response': 'Web search completed but no results were returned. Please try rephrasing your query or check the logs for errors.',
+                    'has_research': False,
+                    'has_code': False
+                })
             return jsonify({
-                'response': web_research_result or "Web search completed but no results returned.",
+                'response': web_research_result,
                 'has_research': True,
                 'has_code': False
             })
@@ -851,8 +1016,7 @@ def research():
                         "exa": {
                             "apiKey": exa_api_key
                         }
-                    },
-                    timeout_ms=600_000  # 10 minutes
+                    }
                 )
                 research_sandboxes[session_id] = research_sandbox
                 print(f"MCP sandbox created. MCP URL: {research_sandbox.get_mcp_url()}")
