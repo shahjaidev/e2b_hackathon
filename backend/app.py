@@ -3,6 +3,8 @@ import base64
 import json
 import atexit
 import signal
+import re
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file
@@ -11,7 +13,8 @@ from dotenv import load_dotenv
 from e2b_code_interpreter import Sandbox
 from e2b import Sandbox as E2BSandbox
 from groq import Groq
-from openai import OpenAI
+import gdown
+import requests
 
 load_dotenv()
 
@@ -33,6 +36,8 @@ active_sandboxes = {}
 uploaded_files = {}
 # Store research sandboxes (MCP-enabled)
 research_sandboxes = {}
+# Store document collections per session (for semantic search)
+document_collections = {}
 
 def cleanup_all_sandboxes():
     """Cleanup all active sandboxes"""
@@ -102,9 +107,608 @@ def get_file_type(filename):
     filename_lower = filename.lower()
     if filename_lower.endswith('.csv'):
         return 'csv'
-    elif filename_lower.endswith(('.xls', '.xlsx', '.xlsm')):
+    elif filename_lower.endswith('.xlsx'):
         return 'excel'
+    elif filename_lower.endswith(('.pdf', '.docx', '.pptx', '.txt', '.md')):
+        return 'document'
     return None
+
+def extract_google_drive_file_id(url):
+    """Extract file ID from Google Drive URL. Returns (file_id, is_folder) tuple."""
+    # Check if it's a folder link
+    if '/drive/folders/' in url or '/folders/' in url:
+        folder_match = re.search(r'/folders/([a-zA-Z0-9_-]+)', url)
+        if folder_match:
+            return folder_match.group(1), True
+    
+    # Pattern for Google Drive file sharing URLs
+    patterns = [
+        r'/file/d/([a-zA-Z0-9_-]+)',
+        r'id=([a-zA-Z0-9_-]+)',
+        r'[a-zA-Z0-9_-]{25,}',  # Direct file ID (25+ chars)
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            file_id = match.group(1) if match.groups() else match.group(0)
+            return file_id, False
+    return None, False
+
+def download_from_google_drive(url, output_path):
+    """Download file from Google Drive using gdown with fallback to requests"""
+    try:
+        # Extract file ID and check if it's a folder
+        file_id, is_folder = extract_google_drive_file_id(url)
+        if not file_id:
+            return None, "Could not extract file ID from Google Drive URL. Please make sure you're sharing a file (not a folder) and the link is public."
+        
+        if is_folder:
+            return None, "Folder links are not supported. Please share the individual file directly. To download a file from a folder: 1) Open the file in Google Drive, 2) Click 'Share', 3) Set it to 'Anyone with the link', 4) Click 'Copy link' to get the file's direct link."
+        
+        print(f"Extracted file ID: {file_id}")
+        
+        # Method 1: Try gdown with proper parameters for public files
+        try:
+            print("Attempting download with gdown...")
+            # Use fuzzy=True for public files and use_cookies=False to avoid cookie issues
+            download_url = f"https://drive.google.com/uc?id={file_id}"
+            gdown.download(
+                download_url, 
+                str(output_path), 
+                quiet=False,
+                fuzzy=True,  # Enable fuzzy matching for public files
+                use_cookies=False  # Don't use cookies (better for server environments)
+            )
+            
+            if output_path.exists() and output_path.stat().st_size > 0:
+                print(f"Successfully downloaded with gdown: {output_path.stat().st_size} bytes")
+                return str(output_path), None
+            else:
+                print("gdown download completed but file is empty or missing, trying requests...")
+                raise Exception("gdown failed")
+        except Exception as gdown_error:
+            print(f"gdown failed: {str(gdown_error)}, trying requests fallback...")
+            
+            # Method 2: Fallback to requests library for direct download
+            try:
+                # Try different Google Drive download URL formats
+                download_urls = [
+                    f"https://drive.google.com/uc?export=download&id={file_id}",
+                    f"https://drive.google.com/uc?id={file_id}&export=download",
+                    f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}",  # With confirmation bypass
+                ]
+                
+                for download_url in download_urls:
+                    try:
+                        print(f"Trying direct download URL: {download_url}")
+                        response = requests.get(
+                            download_url,
+                            stream=True,
+                            timeout=30,
+                            allow_redirects=True,
+                            headers={
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                            }
+                        )
+                        response.raise_for_status()
+                        
+                        # Check if we got a virus scan warning page (small HTML file)
+                        content_type = response.headers.get('Content-Type', '')
+                        if 'text/html' in content_type:
+                            # This might be a virus scan warning, try to extract the actual download link
+                            html_content = response.text[:1000]  # First 1KB to check
+                            if 'virus scan warning' in html_content.lower() or 'download anyway' in html_content.lower():
+                                # Extract the confirm parameter from the HTML
+                                confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', html_content)
+                                if confirm_match:
+                                    confirm_token = confirm_match.group(1)
+                                    download_url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id}"
+                                    print(f"Found confirmation token, retrying with: {download_url}")
+                                    response = requests.get(
+                                        download_url,
+                                        stream=True,
+                                        timeout=30,
+                                        allow_redirects=True,
+                                        headers={
+                                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                                        }
+                                    )
+                                    response.raise_for_status()
+                        
+                        # Download the file
+                        total_size = 0
+                        with open(output_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                                    total_size += len(chunk)
+                        
+                        if output_path.exists() and output_path.stat().st_size > 0:
+                            print(f"Successfully downloaded with requests: {output_path.stat().st_size} bytes")
+                            return str(output_path), None
+                        else:
+                            print(f"Download completed but file is empty (size: {output_path.stat().st_size if output_path.exists() else 0})")
+                            continue
+                            
+                    except requests.exceptions.RequestException as req_error:
+                        print(f"Request failed for {download_url}: {str(req_error)}")
+                        continue
+                
+                # If all methods failed
+                return None, "All download methods failed. Possible reasons:\n1. The file may be too large (>100MB)\n2. The file requires authentication (make sure sharing is set to 'Anyone with the link')\n3. The link may be invalid or expired\n4. The file may have been deleted or moved\n\nPlease verify the file is publicly accessible and try again."
+                
+            except Exception as requests_error:
+                return None, f"Both gdown and requests failed. Last error: {str(requests_error)}"
+        
+    except Exception as e:
+        return None, f"Download failed: {str(e)}"
+
+def ensure_semtools_installed(sandbox):
+    """Ensure semtools is installed in the sandbox"""
+    try:
+        # Check if semtools is installed
+        check_code = """
+import subprocess
+import shutil
+
+# Check if semtools command exists
+semtools_path = shutil.which('semtools')
+if semtools_path:
+    print(f"semtools found at: {semtools_path}")
+else:
+    print("not_found")
+"""
+        result = sandbox.run_code(check_code)
+        
+        needs_install = False
+        if result.logs and result.logs.stdout:
+            output = ''.join(result.logs.stdout).strip()
+            if 'not_found' in output or not output or 'semtools found' not in output:
+                needs_install = True
+        
+        if needs_install:
+            # Install semtools via npm (preferred) or pip
+            print("Installing semtools in sandbox...")
+            install_code = """
+import subprocess
+import sys
+
+# Try npm first (preferred method)
+try:
+    result = subprocess.run(['npm', 'install', '-g', '@llamaindex/semtools'], 
+                           capture_output=True, text=True, timeout=120)
+    if result.returncode == 0:
+        print("semtools installed via npm")
+    else:
+        raise Exception("npm install failed")
+except Exception as npm_error:
+    print(f"npm install failed: {npm_error}, trying pip...")
+    try:
+        result = subprocess.run([sys.executable, '-m', 'pip', 'install', 'semtools'], 
+                               capture_output=True, text=True, timeout=120)
+        if result.returncode == 0:
+            print("semtools installed via pip")
+        else:
+            print(f"pip install also failed: {result.stderr}")
+    except Exception as pip_error:
+        print(f"pip install failed: {pip_error}")
+
+# Verify installation
+import shutil
+semtools_path = shutil.which('semtools')
+if semtools_path:
+    print(f"semtools successfully installed at: {semtools_path}")
+else:
+    print("WARNING: semtools installation may have failed")
+"""
+            install_result = sandbox.run_code(install_code)
+            if install_result.logs and install_result.logs.stdout:
+                print(f"Semtools installation output: {''.join(install_result.logs.stdout)}")
+        else:
+            print("Semtools already installed")
+        return True
+    except Exception as e:
+        print(f"Error checking/installing semtools: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def parse_documents_in_sandbox(sandbox, documents_dir="/home/user/documents"):
+    """Parse documents in sandbox - extract text from PDFs, DOCX, etc. for LLM processing"""
+    try:
+        # Parse documents to extract text content
+        # This is necessary because Groq/Qwen3 only accepts text, not binary files
+        parse_code = f"""
+import subprocess
+import os
+import glob
+import sys
+
+# Find all document files
+doc_patterns = ['{documents_dir}/*.pdf', '{documents_dir}/*.docx', '{documents_dir}/*.pptx', '{documents_dir}/*.txt', '{documents_dir}/*.md']
+files = []
+for pattern in doc_patterns:
+    files.extend(glob.glob(pattern))
+
+parsed_files = []
+
+for file_path in files:
+    file_ext = os.path.splitext(file_path)[1].lower()
+    output_path = os.path.splitext(file_path)[0] + '.txt'
+    
+    try:
+        if file_ext == '.pdf':
+            # Try PyPDF2 or pdfplumber for PDF extraction
+            try:
+                import PyPDF2
+                with open(file_path, 'rb') as f:
+                    pdf_reader = PyPDF2.PdfReader(f)
+                    text_content = []
+                    for page in pdf_reader.pages:
+                        text_content.append(page.extract_text())
+                    with open(output_path, 'w', encoding='utf-8') as out:
+                        out.write('\\n\\n'.join(text_content))
+                    parsed_files.append(output_path)
+                    print(f"Parsed PDF: {{file_path}} -> {{output_path}}")
+            except ImportError:
+                # Try pdfplumber
+                try:
+                    import pdfplumber
+                    text_content = []
+                    with pdfplumber.open(file_path) as pdf:
+                        for page in pdf.pages:
+                            text_content.append(page.extract_text() or '')
+                    with open(output_path, 'w', encoding='utf-8') as out:
+                        out.write('\\n\\n'.join(text_content))
+                    parsed_files.append(output_path)
+                    print(f"Parsed PDF: {{file_path}} -> {{output_path}}")
+                except ImportError:
+                    # Fallback: try semtools parse if available
+                    try:
+                        result = subprocess.run(['semtools', 'parse', file_path], 
+                                              capture_output=True, text=True, timeout=60)
+                        if result.returncode == 0:
+                            # semtools outputs to stdout or creates .md file
+                            md_path = os.path.splitext(file_path)[0] + '.md'
+                            if os.path.exists(md_path):
+                                parsed_files.append(md_path)
+                                print(f"Parsed PDF with semtools: {{file_path}} -> {{md_path}}")
+                    except:
+                        print(f"Warning: Could not parse PDF {{file_path}}. Install PyPDF2 or pdfplumber: pip install PyPDF2 pdfplumber")
+        
+        elif file_ext == '.docx':
+            try:
+                import docx
+                doc = docx.Document(file_path)
+                text_content = '\\n'.join([para.text for para in doc.paragraphs])
+                with open(output_path, 'w', encoding='utf-8') as out:
+                    out.write(text_content)
+                parsed_files.append(output_path)
+                print(f"Parsed DOCX: {{file_path}} -> {{output_path}}")
+            except ImportError:
+                print(f"Warning: Could not parse DOCX {{file_path}}. Install python-docx: pip install python-docx")
+        
+        elif file_ext in ['.txt', '.md']:
+            # Already text files, no parsing needed
+            parsed_files.append(file_path)
+            print(f"Text file (no parsing needed): {{file_path}}")
+    
+    except Exception as e:
+        print(f"Error parsing {{file_path}}: {{str(e)}}")
+
+if parsed_files:
+    print(f"Successfully parsed {{len(parsed_files)}} files")
+else:
+    print("No files were parsed (may need to install parsing libraries)")
+"""
+        result = sandbox.run_code(parse_code)
+        return result
+    except Exception as e:
+        print(f"Error parsing documents: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def semantic_search_documents(sandbox, query, documents_dir="/home/user/documents", max_distance=0.5, top_k=5):
+    """Perform agentic search to find relevant documents, then extract text from PDFs using LlamaParse"""
+    try:
+        # Ensure semtools is installed
+        ensure_semtools_installed(sandbox)
+        
+        # Get LlamaParse API key
+        llama_api_key = os.getenv('LLAMA_CLOUD_API_KEY')
+        has_llamaparse = bool(llama_api_key)
+        
+        # Escape query for shell
+        escaped_query = query.replace("'", "'\"'\"'")
+        
+        # Step 1: Agentic search to find relevant documents
+        # Use semtools search to find which documents/files are relevant to the query
+        search_code = f"""
+import subprocess
+import os
+import json
+import glob
+import shlex
+
+# Find all available documents (PDFs, DOCX, text files, etc.)
+all_documents = []
+for pattern in ['*.pdf', '*.docx', '*.pptx', '*.txt', '*.md', '*.markdown']:
+    files = glob.glob(os.path.join('{documents_dir}', '**', pattern), recursive=True)
+    all_documents.extend(files)
+
+# Also check for already parsed text files
+parsed_text_files = []
+for pattern in ['*.txt', '*.md', '*.markdown']:
+    files = glob.glob(os.path.join('{documents_dir}', '**', pattern), recursive=True)
+    parsed_text_files.extend(files)
+
+print(f"Found {{len(all_documents)}} total documents, {{len(parsed_text_files)}} already parsed")
+
+# If we have parsed text files, use semtools search on them first
+relevant_files = []
+if parsed_text_files:
+    try:
+        files_str = ' '.join([shlex.quote(f) for f in parsed_text_files[:20]])
+        query_escaped = shlex.quote('{escaped_query}')
+        cmd = f"semtools search {query_escaped} {files_str} --max-distance {max_distance} --top-k {top_k} --n-lines 2"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, cwd='/home/user')
+        if result.returncode == 0 and result.stdout:
+            # Extract file paths from search results
+            output_lines = result.stdout.split('\\n')
+            for line in output_lines:
+                # Look for file paths in the output
+                if '{documents_dir}' in line or any(ext in line for ext in ['.txt', '.md', '.pdf', '.docx']):
+                    # Try to extract file path
+                    for doc in all_documents + parsed_text_files:
+                        if os.path.basename(doc) in line or doc in line:
+                            if doc not in relevant_files:
+                                relevant_files.append(doc)
+            print(f"Agentic search found {{len(relevant_files)}} relevant files")
+            if result.stdout:
+                print("Search results preview:")
+                print(result.stdout[:1000])  # Preview of search results
+    except Exception as e:
+        print(f"Semtools search error: {{str(e)}}")
+
+# If no relevant files found, use all documents
+if not relevant_files:
+    relevant_files = all_documents[:10]  # Limit to first 10
+
+# Identify PDFs that need parsing
+pdfs_to_parse = [f for f in relevant_files if f.lower().endswith('.pdf')]
+print(f"Found {{len(pdfs_to_parse)}} PDFs that may need parsing")
+
+# Output results as JSON for processing
+results = {{
+    'relevant_files': relevant_files,
+    'pdfs_to_parse': pdfs_to_parse,
+    'parsed_text_files': parsed_text_files,
+    'all_documents': all_documents
+}}
+print("\\n=== SEARCH RESULTS ===")
+print(json.dumps(results, indent=2))
+"""
+        result = sandbox.run_code(search_code)
+        
+        # Parse the JSON output to get relevant files
+        relevant_files = []
+        pdfs_to_parse = []
+        search_preview = ""
+        
+        if result.logs and result.logs.stdout:
+            output = ''.join(result.logs.stdout)
+            search_preview = output
+            
+            # Try to extract JSON from output
+            try:
+                # Find JSON in output
+                json_start = output.find('{')
+                json_end = output.rfind('}') + 1
+                if json_start >= 0 and json_end > json_start:
+                    json_str = output[json_start:json_end]
+                    search_data = json.loads(json_str)
+                    relevant_files = search_data.get('relevant_files', [])
+                    pdfs_to_parse = search_data.get('pdfs_to_parse', [])
+            except:
+                pass
+        
+        # Step 2: Use LlamaParse to extract text from PDFs if available
+        extracted_texts = {}
+        if pdfs_to_parse and has_llamaparse:
+            print(f"Using LlamaParse to extract text from {len(pdfs_to_parse)} PDFs...")
+            extracted_texts = parse_pdfs_with_llamaparse(sandbox, pdfs_to_parse, llama_api_key)
+        elif pdfs_to_parse:
+            print(f"LlamaParse not available, using fallback PDF parsing for {len(pdfs_to_parse)} PDFs...")
+            extracted_texts = parse_pdfs_fallback(sandbox, pdfs_to_parse)
+        
+        # Step 3: Combine search results with extracted PDF text
+        final_results = search_preview
+        
+        if extracted_texts:
+            final_results += "\n\n=== EXTRACTED PDF CONTENT ===\n"
+            for pdf_path, text_content in extracted_texts.items():
+                if text_content:
+                    final_results += f"\n--- Content from {os.path.basename(pdf_path)} ---\n"
+                    final_results += text_content[:2000]  # Limit each PDF to 2000 chars
+                    final_results += "\n"
+        
+        return final_results if final_results else None
+        
+    except Exception as e:
+        print(f"Error in semantic search: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def parse_pdfs_with_llamaparse(sandbox, pdf_paths, api_key):
+    """Use LlamaParse via semtools to extract text from PDFs"""
+    extracted_texts = {}
+    
+    try:
+        # Set up LlamaParse API key in sandbox environment
+        setup_code = f"""
+import os
+os.environ['LLAMA_CLOUD_API_KEY'] = '{api_key}'
+print("LlamaParse API key configured")
+"""
+        sandbox.run_code(setup_code)
+        
+        # Parse each PDF using semtools parse (which uses LlamaParse)
+        for pdf_path in pdf_paths[:5]:  # Limit to 5 PDFs
+            try:
+                parse_code = f"""
+import subprocess
+import os
+import json
+
+pdf_path = '{pdf_path}'
+output_path = os.path.splitext(pdf_path)[0] + '_parsed.md'
+
+# Use semtools parse with LlamaParse backend
+try:
+    # Set API key
+    os.environ['LLAMA_CLOUD_API_KEY'] = '{api_key}'
+    
+    # Run semtools parse
+    result = subprocess.run(
+        ['semtools', 'parse', pdf_path],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=os.environ.copy()
+    )
+    
+    if result.returncode == 0:
+        # semtools parse outputs markdown to stdout or creates a file
+        if os.path.exists(output_path):
+            with open(output_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            # Check if output is in stdout
+            content = result.stdout if result.stdout else ""
+        
+        if content:
+            print(f"SUCCESS: Parsed {{pdf_path}}")
+            print(f"CONTENT_LENGTH: {{len(content)}}")
+            print(f"CONTENT_PREVIEW: {{content[:500]}}")
+        else:
+            print(f"WARNING: No content extracted from {{pdf_path}}")
+    else:
+        print(f"ERROR: semtools parse failed: {{result.stderr}}")
+except Exception as e:
+    print(f"ERROR parsing {{pdf_path}}: {{str(e)}}")
+"""
+                result = sandbox.run_code(parse_code)
+                
+                # Extract content from result
+                if result.logs and result.logs.stdout:
+                    output = ''.join(result.logs.stdout)
+                    # Try to extract content preview
+                    if 'CONTENT_PREVIEW:' in output:
+                        content_start = output.find('CONTENT_PREVIEW:') + len('CONTENT_PREVIEW:')
+                        content = output[content_start:].strip()
+                        if content:
+                            extracted_texts[pdf_path] = content
+                    elif 'SUCCESS' in output:
+                        # Content might be in a file, try to read it
+                        md_path = pdf_path.replace('.pdf', '_parsed.md')
+                        read_code = f"""
+import os
+md_path = '{md_path}'
+if os.path.exists(md_path):
+    with open(md_path, 'r', encoding='utf-8') as f:
+        print(f.read()[:5000])
+else:
+    print("Parsed file not found")
+"""
+                        read_result = sandbox.run_code(read_code)
+                        if read_result.logs and read_result.logs.stdout:
+                            content = ''.join(read_result.logs.stdout).strip()
+                            if content and content != "Parsed file not found":
+                                extracted_texts[pdf_path] = content
+                
+            except Exception as e:
+                print(f"Error parsing PDF {pdf_path} with LlamaParse: {e}")
+                continue
+        
+    except Exception as e:
+        print(f"Error in LlamaParse setup: {e}")
+    
+    return extracted_texts
+
+def parse_pdfs_fallback(sandbox, pdf_paths):
+    """Fallback PDF parsing using PyPDF2 or pdfplumber"""
+    extracted_texts = {}
+    
+    parse_code = f"""
+import os
+import glob
+
+pdf_paths = {json.dumps(pdf_paths[:5])}  # Limit to 5 PDFs
+
+for pdf_path in pdf_paths:
+    if not os.path.exists(pdf_path):
+        continue
+    
+    output_path = os.path.splitext(pdf_path)[0] + '_parsed.txt'
+    
+    try:
+        # Try PyPDF2 first
+        try:
+            import PyPDF2
+            with open(pdf_path, 'rb') as f:
+                pdf_reader = PyPDF2.PdfReader(f)
+                text_content = []
+                for page in pdf_reader.pages:
+                    text_content.append(page.extract_text())
+                content = '\\n\\n'.join(text_content)
+                with open(output_path, 'w', encoding='utf-8') as out:
+                    out.write(content)
+                print(f"SUCCESS: Parsed {{pdf_path}} with PyPDF2")
+                print(f"CONTENT_PREVIEW: {{content[:500]}}")
+        except ImportError:
+            # Try pdfplumber
+            try:
+                import pdfplumber
+                text_content = []
+                with pdfplumber.open(pdf_path) as pdf:
+                    for page in pdf.pages:
+                        text_content.append(page.extract_text() or '')
+                content = '\\n\\n'.join(text_content)
+                with open(output_path, 'w', encoding='utf-8') as out:
+                    out.write(content)
+                print(f"SUCCESS: Parsed {{pdf_path}} with pdfplumber")
+                print(f"CONTENT_PREVIEW: {{content[:500]}}")
+            except ImportError:
+                print(f"ERROR: No PDF parsing libraries available for {{pdf_path}}")
+    except Exception as e:
+        print(f"ERROR parsing {{pdf_path}}: {{str(e)}}")
+"""
+    result = sandbox.run_code(parse_code)
+    
+    # Extract content from results
+    if result.logs and result.logs.stdout:
+        output = ''.join(result.logs.stdout)
+        for pdf_path in pdf_paths[:5]:
+            if f'SUCCESS: Parsed {pdf_path}' in output:
+                # Try to read the parsed file
+                txt_path = pdf_path.replace('.pdf', '_parsed.txt')
+                read_code = f"""
+import os
+txt_path = '{txt_path}'
+if os.path.exists(txt_path):
+    with open(txt_path, 'r', encoding='utf-8') as f:
+        print(f.read()[:5000])
+"""
+                read_result = sandbox.run_code(read_code)
+                if read_result.logs and read_result.logs.stdout:
+                    content = ''.join(read_result.logs.stdout).strip()
+                    if content:
+                        extracted_texts[pdf_path] = content
+    
+    return extracted_texts
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
@@ -123,7 +727,7 @@ def upload_file():
         
         file_type = get_file_type(file.filename)
         if not file_type:
-            return jsonify({'error': 'Only CSV, XLS, and Excel (.xlsx, .xlsm) files are allowed'}), 400
+            return jsonify({'error': 'Only CSV and Excel (.xlsx) files are allowed'}), 400
         
         # Save file locally
         print("Saving file locally...")
@@ -149,6 +753,8 @@ def upload_file():
             analysis_code = f"""
 import pandas as pd
 import json
+import numpy as np
+
 # Read only first few rows to get structure quickly
 df = pd.read_csv("{sandbox_path.path}", nrows=100)
 # Get row count efficiently
@@ -157,93 +763,87 @@ try:
         total_rows = sum(1 for line in f) - 1  # Subtract header
 except:
     total_rows = len(df)
+
+# Replace NaN values with None for JSON serialization
+df_sample = df.head(3)
+# Convert NaN/NaT to None for JSON serialization
+df_sample = df_sample.where(pd.notna(df_sample), None)
+sample_data = df_sample.to_dict(orient='records')
+
+# Convert any remaining NaN/NaT values to None in the sample data
+# This handles edge cases where fillna might not catch everything
+def clean_nan(obj):
+    if isinstance(obj, dict):
+        return dict((k, clean_nan(v)) for k, v in obj.items())
+    elif isinstance(obj, list):
+        return [clean_nan(item) for item in obj]
+    elif pd.isna(obj) or (isinstance(obj, float) and np.isnan(obj)):
+        return None
+    else:
+        return obj
+
+sample_data = [clean_nan(record) for record in sample_data]
+
 columns_info = {{
     'columns': list(df.columns),
     'shape': [total_rows, len(df.columns)],
     'dtypes': df.dtypes.astype(str).to_dict(),
-    'sample': df.head(3).to_dict(orient='records')
+    'sample': sample_data
 }}
 print(json.dumps(columns_info))
 """
-        else:  # excel
+        else:  # excel (.xlsx) - simplified for single sheet
             analysis_code = f"""
 import pandas as pd
 import json
+import numpy as np
+
+file_path = "{sandbox_path.path}"
 
 try:
-    # Get all sheet names
-    xl_file = pd.ExcelFile("{sandbox_path.path}")
-    sheet_names = xl_file.sheet_names
-except Exception as e:
-    # If Excel reading fails, return error info
-    columns_info = {{
-        'columns': [],
-        'shape': [0, 0],
-        'dtypes': {{}},
-        'sample': [],
-        'error': f'Failed to read Excel file: {{str(e)}}',
-        'sheets': {{}},
-        'sheet_names': [],
-        'default_sheet': None
-    }}
-    print(json.dumps(columns_info))
-    exit(0)
-
-# Analyze each sheet
-sheets_info = {{}}
-
-# Analyze each sheet
-sheets_info = {{}}
-for sheet_name in sheet_names:
-    try:
-        # Read only first few rows to get structure quickly
-        df = pd.read_excel("{sandbox_path.path}", sheet_name=sheet_name, nrows=100)
+    # Read only first few rows to get structure quickly (single sheet assumed)
+    df = pd.read_excel(file_path, engine='openpyxl', nrows=100)
         # Get row count efficiently
         try:
             # For Excel files, read the full sheet to get accurate row count
-            df_full = pd.read_excel("{sandbox_path.path}", sheet_name=sheet_name)
+        df_full = pd.read_excel(file_path, engine='openpyxl')
             total_rows = len(df_full)
         except:
             total_rows = len(df)
         
-        sheets_info[sheet_name] = {{
+        # Replace NaN values with None for JSON serialization
+    df_sample = df.head(3)
+    # Convert NaN/NaT to None for JSON serialization
+    df_sample = df_sample.where(pd.notna(df_sample), None)
+        sample_data = df_sample.to_dict(orient='records')
+        
+        # Convert any remaining NaN/NaT values to None in the sample data
+        def clean_nan(obj):
+            if isinstance(obj, dict):
+                return dict((k, clean_nan(v)) for k, v in obj.items())
+            elif isinstance(obj, list):
+                return [clean_nan(item) for item in obj]
+            elif pd.isna(obj) or (isinstance(obj, float) and np.isnan(obj)):
+                return None
+            else:
+                return obj
+        
+        sample_data = [clean_nan(record) for record in sample_data]
+        
+    columns_info = {{
             'columns': list(df.columns),
             'shape': [total_rows, len(df.columns)],
             'dtypes': df.dtypes.astype(str).to_dict(),
-            'sample': df.head(3).to_dict(orient='records')
+            'sample': sample_data
         }}
     except Exception as e:
-        sheets_info[sheet_name] = {{
+    # If Excel reading fails, return error info
+    columns_info = {{
             'columns': [],
             'shape': [0, 0],
             'dtypes': {{}},
             'sample': [],
-            'error': str(e)
-        }}
-
-# If only one sheet, also include it at the top level for backward compatibility
-if len(sheet_names) == 1:
-    default_sheet = sheet_names[0]
-    columns_info = {{
-        'columns': sheets_info[default_sheet]['columns'],
-        'shape': sheets_info[default_sheet]['shape'],
-        'dtypes': sheets_info[default_sheet]['dtypes'],
-        'sample': sheets_info[default_sheet]['sample'],
-        'sheets': sheets_info,
-        'sheet_names': sheet_names,
-        'default_sheet': default_sheet
-    }}
-else:
-    # For multiple sheets, use the first sheet as default but include all sheets info
-    default_sheet = sheet_names[0]
-    columns_info = {{
-        'columns': sheets_info[default_sheet]['columns'],
-        'shape': sheets_info[default_sheet]['shape'],
-        'dtypes': sheets_info[default_sheet]['dtypes'],
-        'sample': sheets_info[default_sheet]['sample'],
-        'sheets': sheets_info,
-        'sheet_names': sheet_names,
-        'default_sheet': default_sheet
+        'error': f'Failed to read Excel file: {{str(e)}}'
     }}
 
 print(json.dumps(columns_info))
@@ -275,10 +875,32 @@ print(json.dumps(columns_info))
             # Return basic structure even if analysis fails
             columns_info = {
                 'columns': [],
-                'shape': (0, 0),
+                'shape': [0, 0],
                 'dtypes': {},
                 'sample': []
             }
+            
+            # Store file info even with error
+            if session_id not in uploaded_files:
+                uploaded_files[session_id] = []
+            
+            file_info = {
+                'filename': file.filename,
+                'sandbox_path': sandbox_path.path,
+                'local_path': str(filepath),
+                'file_type': file_type,
+                'columns_info': columns_info
+            }
+            uploaded_files[session_id].append(file_info)
+            
+            return jsonify({
+                'success': True,
+                'filename': file.filename,
+                'sandbox_path': sandbox_path.path,
+                'columns_info': columns_info,
+                'session_id': session_id,
+                'warning': f'Could not analyze {file_type.upper()} file structure automatically'
+            })
         else:
             # Extract the actual dictionary value from the result
             columns_info = {}
@@ -338,13 +960,18 @@ print(json.dumps(columns_info))
                     'sample': []
                 }
         
-            uploaded_files[session_id] = {
+            # Store files as a list to support multiple uploads
+            if session_id not in uploaded_files:
+                uploaded_files[session_id] = []
+            
+            file_info = {
                 'filename': file.filename,
                 'sandbox_path': sandbox_path.path,
                 'local_path': str(filepath),
                 'file_type': file_type,
                 'columns_info': columns_info
             }
+            uploaded_files[session_id].append(file_info)
             
             print(f"Upload completed successfully. Columns: {len(columns_info.get('columns', []))}")
             return jsonify({
@@ -361,8 +988,156 @@ print(json.dumps(columns_info))
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-def determine_query_type_with_llm(message, has_csv_data=False, csv_columns=None):
-    """Use LLM to determine if query needs CSV analysis, web search, or both"""
+@app.route('/api/download-google-drive', methods=['POST'])
+def download_google_drive():
+    """Download files from Google Drive link to e2b sandbox"""
+    try:
+        data = request.json
+        google_drive_url = data.get('url', '')
+        session_id = data.get('session_id', 'default')
+        
+        if not google_drive_url:
+            return jsonify({'error': 'No Google Drive URL provided'}), 400
+        
+        print(f"Downloading from Google Drive: {google_drive_url}, session_id: {session_id}")
+        
+        # Get or create sandbox
+        sbx = get_or_create_sandbox(session_id)
+        
+        # Create documents directory in sandbox
+        documents_dir = "/home/user/documents"
+        mkdir_code = f"mkdir -p {documents_dir}"
+        sbx.run_code(mkdir_code)
+        
+        # Download file locally first
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        temp_filename = f"gdrive_download_{timestamp}"
+        temp_path = UPLOAD_DIR / temp_filename
+        
+        file_path, error = download_from_google_drive(google_drive_url, temp_path)
+        if error:
+            return jsonify({'error': error}), 400
+        
+        # Determine actual filename from downloaded file
+        downloaded_file = Path(file_path)
+        if not downloaded_file.exists():
+            return jsonify({'error': 'Downloaded file not found'}), 500
+        
+        # Try to get original filename from Google Drive (if possible)
+        # For now, use a generic name based on extension
+        file_extension = downloaded_file.suffix if downloaded_file.suffix else '.bin'
+        final_filename = f"document_{timestamp}{file_extension}"
+        
+        # Upload to sandbox
+        with open(downloaded_file, 'rb') as f:
+            sandbox_path = sbx.files.write(f"{documents_dir}/{final_filename}", f)
+        
+        print(f"File uploaded to sandbox: {sandbox_path.path}")
+        
+        # Initialize document collection for this session
+        if session_id not in document_collections:
+            document_collections[session_id] = []
+        
+        document_collections[session_id].append({
+            'filename': final_filename,
+            'sandbox_path': sandbox_path.path,
+            'local_path': str(downloaded_file),
+            'url': google_drive_url
+        })
+        
+        # Note: Documents will be parsed on-demand during semantic search
+        # This allows us to use agentic search first, then parse only relevant PDFs with LlamaParse
+        print(f"Document {final_filename} ready for agentic search")
+        
+        # Clean up local file
+        try:
+            downloaded_file.unlink()
+        except:
+            pass
+        
+        return jsonify({
+            'success': True,
+            'filename': final_filename,
+            'sandbox_path': sandbox_path.path,
+            'session_id': session_id,
+            'message': f'File downloaded and uploaded to sandbox successfully'
+        })
+    
+    except Exception as e:
+        print(f"Error in download_google_drive: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+def select_relevant_csvs(query, csv_files_info):
+    """Use LLM to select which CSV file(s) are most relevant to the query"""
+    try:
+        if len(csv_files_info) == 0:
+            return []
+        if len(csv_files_info) == 1:
+            return [0]  # Return index of the single file
+        
+        # Build file descriptions for LLM
+        files_description = ""
+        for idx, file_info in enumerate(csv_files_info):
+            filename = file_info.get('filename', 'unknown')
+            columns = file_info.get('columns', [])
+            file_type = file_info.get('file_type', 'csv')
+            shape = file_info.get('columns_info', {}).get('shape', [0, 0])
+            files_description += f"\n{idx}. {filename} ({file_type.upper()})\n"
+            files_description += f"   Columns: {', '.join(columns[:10])}{'...' if len(columns) > 10 else ''}\n"
+            files_description += f"   Shape: {shape[0]} rows x {shape[1]} columns\n"
+        
+        prompt = f"""Given the user's query and multiple CSV/Excel files, determine which file(s) are most relevant.
+
+User query: "{query}"
+
+Available files:
+{files_description}
+
+Respond with ONLY a comma-separated list of file numbers (0-indexed) that are relevant to the query.
+For example: "0" for file 0, "0,2" for files 0 and 2, or "all" if all files are needed.
+If the query doesn't clearly relate to any specific file, respond with "all"."""
+        
+        response = groq_client.chat.completions.create(
+            model="qwen/qwen3-32b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a file selection assistant. Analyze queries and select the most relevant CSV/Excel files. Respond with only comma-separated numbers or 'all'."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.1,
+            max_tokens=50
+        )
+        
+        selection = response.choices[0].message.content.strip().lower()
+        
+        # Parse selection
+        if selection == 'all':
+            return list(range(len(csv_files_info)))
+        
+        # Parse comma-separated indices
+        try:
+            indices = [int(x.strip()) for x in selection.split(',')]
+            # Validate indices
+            valid_indices = [idx for idx in indices if 0 <= idx < len(csv_files_info)]
+            return valid_indices if valid_indices else list(range(len(csv_files_info)))
+        except:
+            # If parsing fails, return all files
+            return list(range(len(csv_files_info)))
+            
+    except Exception as e:
+        print(f"Error selecting relevant CSVs: {e}")
+        # Fallback: return all files
+        return list(range(len(csv_files_info)))
+
+def determine_query_type_with_llm(message, has_csv_data=False, csv_columns=None, has_documents=False):
+    """Use LLM to determine if query needs CSV analysis, web search, document search, or combination"""
     try:
         # Simple, clear prompt for Groq to detect intent
         prompt = f"""Analyze this user query and determine what action is needed:
@@ -371,10 +1146,18 @@ User query: "{message}"
 
 Available actions:
 1. csv_only - Query is EXPLICITLY asking to analyze CSV data (e.g., "show statistics", "analyze the data", "what's in the CSV")
-2. web_search_only - Query asks for research, information, facts, news, or anything NOT in CSV data (e.g., "research X", "find information about Y", "what is Z", "tell me about")
-3. both - Query EXPLICITLY needs both CSV analysis AND web research
-4. needs_csv - Query EXPLICITLY asks to analyze a CSV file but none exists
+2. web_search_only - Query asks for research, information, facts, news, or anything NOT in uploaded data (e.g., "research X", "find information about Y", "what is Z", "tell me about")
+3. document_search - Query asks about content in uploaded documents (e.g., "what does the document say", "summarize the document", "find information in the files")
+4. both - Query EXPLICITLY needs both CSV analysis AND web research
+5. needs_csv - Query EXPLICITLY asks to analyze a CSV file but none exists
 
+"""
+        
+        if has_documents:
+            prompt += f"""Documents ARE available in the sandbox.
+
+IMPORTANT: ONLY use document_search if the query EXPLICITLY mentions documents, files, uploaded content, or asks questions like "what does the document say", "summarize the file", "what's in the uploaded document". 
+For general questions, research queries, or questions not explicitly about document content, use web_search_only.
 """
         
         if has_csv_data and csv_columns:
@@ -386,12 +1169,12 @@ Only use csv_only if the query is clearly about analyzing the uploaded CSV data.
         else:
             prompt += """NO CSV file is uploaded.
 
-IMPORTANT: If the user asks ANY question (research, information, facts, companies, news, etc.), respond with web_search_only.
+IMPORTANT: If the user asks ANY question (research, information, facts, companies, news, etc.) and no documents are available, respond with web_search_only.
 Only use needs_csv if the query EXPLICITLY asks to analyze a CSV file that doesn't exist.
 """
         
         prompt += """
-Respond with ONLY one word: csv_only, web_search_only, both, or needs_csv"""
+Respond with ONLY one word: csv_only, web_search_only, document_search, both, or needs_csv"""
 
         # Call Groq to determine intent
         response = groq_client.chat.completions.create(
@@ -399,7 +1182,7 @@ Respond with ONLY one word: csv_only, web_search_only, both, or needs_csv"""
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a query router. Analyze the user's query and respond with ONLY one word: csv_only, web_search_only, both, or needs_csv. If the query mentions research, search, or asks for information, use web_search_only."
+                    "content": "You are a query router. Analyze the user's query and respond with ONLY one word: csv_only, web_search_only, document_search, both, or needs_csv. Use document_search ONLY if the query explicitly mentions documents/files. For general questions or research, use web_search_only."
                 },
                 {
                     "role": "user",
@@ -413,27 +1196,51 @@ Respond with ONLY one word: csv_only, web_search_only, both, or needs_csv"""
         query_type = response.choices[0].message.content.strip().lower()
         
         # Extract just the type if LLM added extra text
-        valid_types = ['csv_only', 'web_search_only', 'both', 'needs_csv']
+        valid_types = ['csv_only', 'web_search_only', 'document_search', 'both', 'needs_csv']
         for valid_type in valid_types:
             if valid_type in query_type:
                 query_type = valid_type
                 break
         
-        # Safety override: if no CSV and query contains research keywords, force web_search_only
-        if not has_csv_data:
+        # Safety override: Only use document_search if documents exist AND query explicitly mentions documents/files
+        if query_type == 'document_search' and not has_documents:
+            print(f"Safety override: document_search requested but no documents available, defaulting to web_search_only")
+            query_type = 'web_search_only'
+        
+        # Safety override: if documents available and query explicitly mentions documents, use document_search
+        if has_documents:
+            document_keywords = ['document', 'file', 'uploaded', 'downloaded', 'what does it say', 'summarize the document', 'in the document', 'from the file', 'in the file', 'what\'s in the document']
+            message_lower = message.lower()
+            # Only override if query explicitly mentions documents/files
+            if any(keyword in message_lower for keyword in document_keywords):
+                if query_type not in ['document_search', 'both']:
+                    print(f"Safety override: forcing document_search for explicit document-related query")
+                    query_type = 'document_search'
+        
+        # Safety override: if no CSV and no documents, and query contains research keywords, force web_search_only
+        if not has_csv_data and not has_documents:
             research_keywords = ['research', 'search', 'find', 'look up', 'tell me', 'what is', 'who is', 'information about']
             message_lower = message.lower()
             if any(keyword in message_lower for keyword in research_keywords):
                 if query_type != 'web_search_only':
-                    print(f"Safety override: forcing web_search_only for research query without CSV")
-                    return 'web_search_only'
+                    print(f"Safety override: forcing web_search_only for research query without CSV or documents")
+                    query_type = 'web_search_only'
         
-        # Safety override: if query_type is needs_csv but no CSV, default to web_search_only
+        # Safety override: if query_type is needs_csv but no CSV, default based on available resources
         if query_type == 'needs_csv' and not has_csv_data:
-            print(f"Safety override: needs_csv without CSV, defaulting to web_search_only")
-            return 'web_search_only'
+            if has_documents:
+                print(f"Safety override: needs_csv without CSV, defaulting to document_search")
+                query_type = 'document_search'
+            else:
+                print(f"Safety override: needs_csv without CSV, defaulting to web_search_only")
+                query_type = 'web_search_only'
         
-        return query_type if query_type in valid_types else ('web_search_only' if not has_csv_data else 'csv_only')
+        # Final fallback: if document_search but no documents, use web_search_only
+        if query_type == 'document_search' and not has_documents:
+            print(f"Final safety check: document_search without documents, using web_search_only")
+            query_type = 'web_search_only'
+        
+        return query_type if query_type in valid_types else ('web_search_only' if not has_csv_data and not has_documents else ('document_search' if has_documents else 'csv_only'))
             
     except Exception as e:
         print(f"Error in LLM-based query type determination: {e}")
@@ -491,19 +1298,13 @@ def perform_web_research(query, research_session_id):
         except Exception as e:
             return None, f"Error getting MCP configuration: {str(e)}"
         
-        # Create OpenAI-compatible client for Groq
-        groq_openai_client = OpenAI(
-            api_key=os.getenv('GROQ_API_KEY'),
-            base_url='https://api.groq.com/openai/v1'
-        )
-        
         research_prompt = f"""{query}
 
 Use Exa to search for recent and relevant information to answer this question comprehensively. 
 Provide a detailed summary with sources and key findings."""
         
         print(f"Calling Groq with MCP tools for web research...")
-        response = groq_openai_client.chat.completions.create(
+        response = groq_client.chat.completions.create(
             model="qwen/qwen3-32b",
             messages=[
                 {
@@ -552,24 +1353,96 @@ def chat():
         
         print(f"Chat request - session_id: {session_id}, message: {message[:100]}")
         
-        # Check if data file is available
-        has_csv = session_id in uploaded_files
-        csv_columns = None
-        file_info = None
+        # Check if data files are available
+        has_csv = session_id in uploaded_files and len(uploaded_files[session_id]) > 0
+        csv_files = uploaded_files.get(session_id, []) if has_csv else []
+        csv_columns = []
+        all_csv_info = []
         
         if has_csv:
-            file_info = uploaded_files[session_id]
-            csv_columns = file_info.get('columns_info', {}).get('columns', [])
+            # Collect all CSV columns and file info
+            for file_info in csv_files:
+                columns = file_info.get('columns_info', {}).get('columns', [])
+                csv_columns.extend(columns)
+                all_csv_info.append({
+                    'filename': file_info.get('filename'),
+                    'columns': columns,
+                    'file_type': file_info.get('file_type'),
+                    'sandbox_path': file_info.get('sandbox_path'),
+                    'columns_info': file_info.get('columns_info', {})
+                })
         
-        # Use LLM to determine what type of query this is
-        query_type = determine_query_type_with_llm(message, has_csv_data=has_csv, csv_columns=csv_columns)
+        # Check if documents are available
+        has_documents = session_id in document_collections and len(document_collections[session_id]) > 0
+        
+        # Use LLM to determine what type of query this is and which CSV(s) to use
+        query_type = determine_query_type_with_llm(message, has_csv_data=has_csv, csv_columns=csv_columns, has_documents=has_documents)
+        
+        # If multiple CSVs, let LLM select which one(s) to use
+        selected_files = []
+        if has_csv and len(csv_files) > 1 and query_type in ['csv_only', 'both']:
+            selected_indices = select_relevant_csvs(message, all_csv_info)
+            selected_files = [csv_files[idx] for idx in selected_indices]
+            print(f"LLM selected {len(selected_files)} CSV file(s) out of {len(csv_files)} available")
+        elif has_csv:
+            selected_files = csv_files  # Use all files if only one or if not csv_only/both
         print(f"Query type determined by LLM: {query_type}")
         
         # Handle different query types
-        # If needs_csv but no CSV, default to web_search_only (allow any query without CSV)
+        # If needs_csv but no CSV, default based on available resources
         if query_type == 'needs_csv' and not has_csv:
-            print(f"Overriding needs_csv to web_search_only (no CSV uploaded, allowing web search)")
+            if has_documents:
+                print(f"Overriding needs_csv to document_search (documents available)")
+                query_type = 'document_search'
+            else:
+                print(f"Overriding needs_csv to web_search_only (no CSV or documents, allowing web search)")
             query_type = 'web_search_only'
+        
+        # Perform document search if needed
+        document_search_result = None
+        document_search_error = None
+        if query_type == 'document_search':
+            print(f"Performing document search for query: {message[:100]}")
+            if not has_documents:
+                # Fallback to web search if documents aren't available
+                print(f"No documents available for document_search, falling back to web_search_only")
+                query_type = 'web_search_only'
+            
+            try:
+                sbx = get_or_create_sandbox(session_id)
+                document_search_result = semantic_search_documents(sbx, message, max_distance=0.5, top_k=5)
+                
+                if not document_search_result:
+                    document_search_error = "Document search returned no results"
+                    print(f"Document search error: {document_search_error}")
+                else:
+                    # Generate answer based on search results
+                    print(f"Document search completed. Generating answer...")
+                    answer_prompt = f"""Based on the following search results from uploaded documents, answer the user's question:
+
+User question: {message}
+
+Search results:
+{document_search_result}
+
+Provide a clear, comprehensive answer based on the search results. If the search results don't fully answer the question, say so."""
+                    
+                    answer_response = groq_client.chat.completions.create(
+                        model="qwen/qwen3-32b",
+                        messages=[
+                            {"role": "system", "content": "You are a helpful assistant that answers questions based on document content."},
+                            {"role": "user", "content": answer_prompt}
+                        ],
+                        temperature=0.3,
+                        max_tokens=1024
+                    )
+                    document_search_result = answer_response.choices[0].message.content
+                    print(f"Document search answer generated ({len(document_search_result)} chars)")
+            except Exception as e:
+                document_search_error = f"Document search failed: {str(e)}"
+                print(f"Document search error: {document_search_error}")
+                import traceback
+                traceback.print_exc()
         
         # Perform web search if needed
         web_research_result = None
@@ -600,80 +1473,104 @@ def chat():
             print(f"Performing CSV analysis for query: {message[:100]}")
             if not has_csv:
                 return jsonify({
-                    'error': 'Please upload a data file (CSV, XLS, or Excel) first',
+                    'error': 'Please upload a data file (CSV or Excel .xlsx) first',
                     'session_id': session_id
                 }), 400
             
             try:
-                file_info = uploaded_files[session_id]
                 sbx = get_or_create_sandbox(session_id)
                 
-                # Create prompt for Groq
-                columns_info = file_info.get('columns_info', {})
-                columns_list = columns_info.get('columns', [])
+                # Use selected files (or all if only one)
+                files_to_analyze = selected_files if selected_files else csv_files
+                
+                if len(files_to_analyze) == 0:
+                    return jsonify({
+                        'error': 'No CSV files selected for analysis',
+                        'session_id': session_id
+                    }), 400
                 
                 # If both data file and web search, incorporate web research context
                 context_note = ""
                 if query_type == 'both' and web_research_result:
                     context_note = f"\n\nIMPORTANT: The user also asked for web research. Here's what was found:\n{web_research_result}\n\nYou can use this context to enhance your analysis, but focus on analyzing the data file."
                 
-                file_type = file_info.get('file_type', 'csv')
-                file_type_name = 'Excel' if file_type == 'excel' else 'CSV'
-                filename = file_info['filename']
+                # Build file information (simplified - single sheet per file)
+                files_info_text = ""
+                load_instructions = ""
                 
-                # Build sheet information for Excel files
-                sheet_info_text = ""
-                if file_type == 'excel':
-                    sheet_names = columns_info.get('sheet_names', [])
-                    sheets_info = columns_info.get('sheets', {})
+                if len(files_to_analyze) == 1:
+                    # Single file
+                    file_info = files_to_analyze[0]
+                    file_type = file_info.get('file_type', 'csv')
+                    file_type_name = 'Excel' if file_type == 'excel' else 'CSV'
+                    filename = file_info['filename']
+                    columns_info = file_info.get('columns_info', {})
+                    columns_list = columns_info.get('columns', [])
+                    shape = columns_info.get('shape', [0, 0])
                     
-                    if sheet_names and len(sheet_names) > 1:
-                        # Multiple sheets - provide detailed information
-                        sheet_info_text = f"\n\nIMPORTANT: This Excel file contains {len(sheet_names)} sheets:\n"
-                        for sheet_name in sheet_names:
-                            sheet_data = sheets_info.get(sheet_name, {})
-                            sheet_cols = sheet_data.get('columns', [])
-                            sheet_shape = sheet_data.get('shape', [0, 0])
-                            sheet_info_text += f"- Sheet '{sheet_name}': {len(sheet_cols)} columns ({', '.join(sheet_cols[:5])}{'...' if len(sheet_cols) > 5 else ''}), {sheet_shape[0]} rows\n"
-                        
-                        sheet_info_text += f"\nCRITICAL: You MUST choose the appropriate sheet based on the user's query. Analyze the query to determine which sheet contains the relevant data.\n"
-                        sheet_names_quoted = ', '.join([f"'{s}'" for s in sheet_names])
-                        sheet_info_text += f"Available sheets: {sheet_names_quoted}\n"
-                        file_path = file_info['sandbox_path']
-                        sheet_info_text += f"To load a specific sheet, use: df = pd.read_excel(\"{file_path}\", sheet_name='SHEET_NAME')\n"
-                        sheet_info_text += f"If the user's query doesn't specify a sheet, intelligently choose the most relevant one based on:\n"
-                        sheet_info_text += f"  1. Column names that match the query topic\n"
-                        sheet_info_text += f"  2. Sheet names that match keywords in the query\n"
-                        sheet_info_text += f"  3. The sheet with the most relevant data structure\n"
-                        sheet_info_text += f"If unsure, you can load multiple sheets and compare, or ask the user to clarify.\n"
-                    elif sheet_names and len(sheet_names) == 1:
-                        # Single sheet - just mention it
-                        sheet_info_text = f"\n\nThis Excel file has one sheet: '{sheet_names[0]}'\n"
-                
-                # Determine the correct pandas function to use
-                if file_type == 'excel':
-                    if columns_info.get('sheet_names') and len(columns_info.get('sheet_names', [])) > 1:
-                        # Multiple sheets - use sheet_name parameter
-                        default_sheet = columns_info.get('default_sheet', columns_info.get('sheet_names', [''])[0])
-                        load_code = f"df = pd.read_excel(\"{file_info['sandbox_path']}\", sheet_name='{default_sheet}')  # Change sheet_name based on user's query"
-                    else:
-                        load_code = f'df = pd.read_excel("{file_info["sandbox_path"]}")'
-                else:
-                    load_code = f'df = pd.read_csv("{file_info["sandbox_path"]}")'
-                
-                system_prompt = f"""You are a data analysis assistant. A {file_type_name} file has been uploaded with the following information:
+                    files_info_text = f"""A {file_type_name} file has been uploaded:
 - Filename: {filename}
 - Path in sandbox: {file_info['sandbox_path']}
-- File type: {file_type_name} ({file_type})
 - Columns: {', '.join(columns_list)}
-- Shape: {columns_info.get('shape', 'Unknown')}
-{sheet_info_text}{context_note}
+- Shape: {shape[0]} rows x {shape[1]} columns"""
+                    
+                    if file_type == 'excel':
+                        load_instructions = f"df = pd.read_excel(\"{file_info['sandbox_path']}\", engine='openpyxl')"
+                    else:
+                        load_instructions = f'df = pd.read_csv("{file_info["sandbox_path"]}")'
+                else:
+                    # Multiple files
+                    files_info_text = f"{len(files_to_analyze)} data files have been uploaded:\n"
+                    load_instructions = "# Load multiple files:\n"
+                    
+                    for idx, file_info in enumerate(files_to_analyze):
+                        filename = file_info['filename']
+                        file_type = file_info.get('file_type', 'csv')
+                        file_type_name = 'Excel' if file_type == 'excel' else 'CSV'
+                        columns_list = file_info.get('columns_info', {}).get('columns', [])
+                        shape = file_info.get('columns_info', {}).get('shape', [0, 0])
+                        
+                        files_info_text += f"\n{idx + 1}. {filename} ({file_type_name}):\n"
+                        files_info_text += f"   - Path: {file_info['sandbox_path']}\n"
+                        files_info_text += f"   - Columns: {', '.join(columns_list[:10])}{'...' if len(columns_list) > 10 else ''}\n"
+                        files_info_text += f"   - Shape: {shape[0]} rows x {shape[1]} columns\n"
+                        
+                        if file_type == 'excel':
+                            load_instructions += f"df{idx + 1} = pd.read_excel(\"{file_info['sandbox_path']}\", engine='openpyxl')\n"
+                        else:
+                            load_instructions += f"df{idx + 1} = pd.read_csv(\"{file_info['sandbox_path']}\")\n"
+                
+                # Build the system prompt
+                if len(files_to_analyze) == 1:
+                    system_prompt = f"""You are a Python code generator for data analysis. {files_info_text}{context_note}
+
+CRITICAL: You MUST respond with ONLY executable Python code wrapped in ```python and ``` markers.
+DO NOT include any explanations, text, or commentary outside the code block.
 
 When the user asks for analysis, generate Python code to:
-1. Load the data file using pandas. The file is a {file_type_name} file, so use:
-   {load_code}
-2. Perform the requested analysis
-3. CRITICAL: Always convert results to strings before printing. For example:
+1. Load the data file using pandas:
+   {load_instructions}
+2. Perform the requested analysis"""
+                else:
+                    system_prompt = f"""You are a Python code generator for data analysis. {files_info_text}{context_note}
+
+CRITICAL: You MUST respond with ONLY executable Python code wrapped in ```python and ``` markers.
+DO NOT include any explanations, text, or commentary outside the code block.
+
+IMPORTANT: You have access to {len(files_to_analyze)} data files. Based on the user's query, you may need to:
+- Use one specific file that's most relevant
+- Combine/merge multiple files if the query requires it
+- Compare data across files
+
+When the user asks for analysis, generate Python code to:
+1. Load the relevant data file(s) using pandas:
+{load_instructions}
+   Use the file(s) that are most relevant to the user's query. If you need to combine files, use pd.merge() or pd.concat().
+2. Perform the requested analysis"""
+                
+                # Common instructions for both single and multiple files
+                common_instructions = """
+3. CRITICAL: Always include print() statements to output results:
    - For column names: print(list(df.columns)) or print(', '.join(df.columns))
    - For statistics: print(df.describe().to_string())
    - For dataframes: print(df.head().to_string()) or print(df.to_string())
@@ -681,129 +1578,424 @@ When the user asks for analysis, generate Python code to:
    - NEVER just print(df.columns) - convert Index to list first: print(list(df.columns))
    - NEVER just print(df) - use .to_string(): print(df.to_string())
 4. Create visualizations using matplotlib when appropriate
-5. Save plots with: plt.savefig('/home/user/chart.png', bbox_inches='tight', dpi=150)
-6. Always end matplotlib code with plt.show() to generate the output
+5. CRITICAL: To generate charts that will be displayed:
+   - Always call plt.show() at the end of your plotting code - this is REQUIRED for the chart to be captured
+   - You can optionally also save with: plt.savefig('/home/user/chart.png', bbox_inches='tight', dpi=150)
+   - But plt.show() MUST be called for the chart to appear in the results
+6. Example plotting code structure:
+   ```python
+   import pandas as pd
+   import matplotlib.pyplot as plt
+   
+   # Load data
+   df = pd.read_csv("/path/to/file.csv")
+   
+   # Prepare data for plotting
+   # ... your data manipulation here ...
+   
+   # Create plot
+   plt.figure(figsize=(10, 6))
+   plt.plot(x_data, y_data)
+   plt.xlabel('X Label')
+   plt.ylabel('Y Label')
+   plt.title('Chart Title')
+   plt.grid(True, alpha=0.3)
+   plt.show()  # THIS IS REQUIRED - do not skip this!
+   ```
 
-CRITICAL REQUIREMENTS:
+CODE FORMAT REQUIREMENTS:
 - Use proper Python indentation (4 spaces per level)
 - All code blocks after if/else/for/while/def must be indented
 - Ensure all code is syntactically correct and executable
 - Use consistent indentation throughout
+- Import all necessary libraries (pandas, matplotlib.pyplot, numpy, etc.)
 
-Respond with ONLY the Python code wrapped in ```python and ``` markers, no explanations before or after.
-Make sure to import necessary libraries (pandas, matplotlib.pyplot, numpy, etc.).
-CRITICAL: Always include print() statements to output results, especially for statistics and data summaries."""
+RESPONSE FORMAT - ABSOLUTELY CRITICAL:
+Your response MUST be ONLY Python code in this exact format:
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
 
-                # Call Groq for code generation
-                print("Calling Groq to generate code...")
-                groq_response = groq_client.chat.completions.create(
-                    model="qwen/qwen3-32b",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": message}
-                    ],
-                    temperature=0.1,
-                    max_tokens=2048
-                )
-                response_text = groq_response.choices[0].message.content
-                csv_code = extract_code_from_response(response_text)
+# Your code here
+df = pd.read_csv("...")
+# ... analysis code ...
+print(results)
+plt.show()  # if creating plots
+```
+
+DO NOT include:
+- Explanations before the code block
+- Text after the code block
+- Comments about what you're going to do
+- Summaries of the code
+
+Just the code block, nothing else."""
+
+                system_prompt += common_instructions
+
+                # STEP 1: ALWAYS EXECUTE df.head() FIRST to ground the analysis
+                print("=" * 80)
+                print("STEP 1: Loading data preview (df.head()) for schema grounding...")
+                print("=" * 80)
                 
-                if not csv_code:
-                    csv_error = "No code was generated from the response"
-                    print(f"CSV analysis error: {csv_error}")
+                data_preview_code = ""
+                
+                for idx, file_info in enumerate(files_to_analyze):
+                    file_path = file_info['sandbox_path']
+                    file_type = file_info.get('file_type', 'csv')
+                    filename = file_info['filename']
+                    
+                    if file_type == 'excel':
+                        data_preview_code += f"""
+# Preview for {filename}
+df_preview_{idx} = pd.read_excel("{file_path}", engine='openpyxl')
+print("\\n{'=' * 60}")
+print("DATA PREVIEW: {filename}")
+print("{'=' * 60}")
+print("Columns:", list(df_preview_{idx}.columns))
+print("Shape:", df_preview_{idx}.shape)
+print("Data types:")
+print(df_preview_{idx}.dtypes)
+print("\\nFirst 10 rows:")
+print(df_preview_{idx}.head(10).to_string())
+print("\\nSummary statistics:")
+print(df_preview_{idx}.describe())
+"""
+                    else:
+                        data_preview_code += f"""
+# Preview for {filename}
+df_preview_{idx} = pd.read_csv("{file_path}")
+print("\\n{'=' * 60}")
+print("DATA PREVIEW: {filename}")
+print("{'=' * 60}")
+print("Columns:", list(df_preview_{idx}.columns))
+print("Shape:", df_preview_{idx}.shape)
+print("Data types:")
+print(df_preview_{idx}.dtypes)
+print("\\nFirst 10 rows:")
+print(df_preview_{idx}.head(10).to_string())
+print("\\nSummary statistics:")
+print(df_preview_{idx}.describe())
+"""
+                
+                # Execute preview code to get actual data context
+                preview_code = f"""
+import pandas as pd
+import warnings
+warnings.filterwarnings('ignore')
+{data_preview_code}
+"""
+                
+                preview_output = ""
+                try:
+                    print("Executing data preview code...")
+                    preview_result = sbx.run_code(preview_code)
+                    
+                    if preview_result.error:
+                        print(f"ERROR in preview execution: {preview_result.error}")
+                        csv_execution_output.append(f"⚠️ Data preview failed: {preview_result.error}")
+                    else:
+                        if preview_result.logs and preview_result.logs.stdout:
+                            preview_output = ''.join(preview_result.logs.stdout)
+                            print(f"✓ Data preview captured successfully ({len(preview_output)} chars)")
+                            # Add preview output to execution output so user sees it
+                            csv_execution_output.append("=" * 60)
+                            csv_execution_output.append("DATA PREVIEW (Schema & Sample)")
+                            csv_execution_output.append("=" * 60)
+                            csv_execution_output.append(preview_output[:2000])  # Limit to avoid too much output
+                            if len(preview_output) > 2000:
+                                csv_execution_output.append("... (preview truncated)")
+                        else:
+                            print("WARNING: Preview executed but no output captured")
+                    
+                    # Add data preview to system prompt for LLM grounding
+                    if preview_output:
+                        system_prompt += f"\n\n{'=' * 60}\nCRITICAL: ACTUAL DATA SCHEMA & PREVIEW\n{'=' * 60}\n{preview_output[:3000]}\n\nYou MUST use these EXACT column names and data types from the preview above when generating analysis code. Do not make assumptions about column names or data structure."
+                    
+                except Exception as e:
+                    error_msg = f"Failed to load data preview: {str(e)}"
+                    print(f"ERROR: {error_msg}")
+                    csv_execution_output.append(f"⚠️ {error_msg}")
+                    import traceback
+                    traceback.print_exc()
+
+                # STEP 2: Generate and execute code with automatic retry loop
+                print("=" * 80)
+                print("STEP 2: Code generation and execution with auto-retry...")
+                print("=" * 80)
+                
+                MAX_RETRIES = 10
+                retry_count = 0
+                execution_successful = False
+                conversation_history = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": message}
+                ]
+                
+                while retry_count < MAX_RETRIES and not execution_successful:
+                    attempt_num = retry_count + 1
+                    print(f"\n{'='*60}")
+                    print(f"ATTEMPT {attempt_num}/{MAX_RETRIES}")
+                    print(f"{'='*60}")
+                    
+                    # Generate code
+                    print(f"Calling Groq to generate code (attempt {attempt_num})...")
+                    groq_response = groq_client.chat.completions.create(
+                        model="qwen/qwen3-32b",
+                        messages=conversation_history,
+                        temperature=0.1 if retry_count == 0 else 0.05,
+                        max_tokens=2048
+                    )
+                    response_text = groq_response.choices[0].message.content
+                    csv_code = extract_code_from_response(response_text)
+                    
+                    if not csv_code:
+                        print(f"❌ Attempt {attempt_num}: Failed to extract code from response")
+                        # Add error feedback to conversation
+                        conversation_history.append({"role": "assistant", "content": response_text})
+                        conversation_history.append({
+                            "role": "user",
+                            "content": f"ERROR: No valid Python code was found in your response. Please provide ONLY a Python code block wrapped in ```python and ```. No explanations, just the code."
+                        })
+                        retry_count += 1
+                        continue
+                    
+                    print(f"✓ Extracted code: {len(csv_code)} chars")
+                    
+                    # Validate syntax
+                    print(f"Validating syntax...")
+                    syntax_error = None
+                    try:
+                        compile(csv_code, '<string>', 'exec')
+                        print("✓ Syntax is valid")
+                    except SyntaxError as e:
+                        syntax_error = f"Syntax error: {e.msg} on line {e.lineno}"
+                        print(f"❌ {syntax_error}")
+                        
+                        # Add error feedback to conversation for retry
+                        conversation_history.append({"role": "assistant", "content": f"```python\n{csv_code}\n```"})
+                        conversation_history.append({
+                            "role": "user",
+                            "content": f"""ERROR: The code has a syntax error:
+{syntax_error}
+
+Please fix this error and provide corrected Python code. Remember:
+- Use proper string delimiters (quotes)
+- Check for unterminated strings
+- Ensure proper indentation
+- Close all brackets and parentheses
+
+Provide ONLY the corrected code in a ```python code block."""
+                        })
+                        retry_count += 1
+                        continue
+                    
+                    # Execute code
+                    print(f"Executing code in sandbox...")
+                    execution = sbx.run_code(csv_code)
+                    
+                    # Check for execution errors
+                    if execution.error:
+                        execution_error = f"{execution.error.name}: {execution.error.value}"
+                        print(f"❌ Execution error: {execution_error}")
+                        
+                        # Capture any output before error
+                        output_before_error = ""
+                        if hasattr(execution, 'logs'):
+                            if hasattr(execution.logs, 'stdout') and execution.logs.stdout:
+                                output_before_error = ''.join(execution.logs.stdout).strip()
+                            if hasattr(execution.logs, 'stderr') and execution.logs.stderr:
+                                stderr = ''.join(execution.logs.stderr).strip()
+                                if stderr:
+                                    output_before_error += f"\nSTDERR: {stderr}"
+                        
+                        # Add error feedback to conversation for retry
+                        error_context = f"""ERROR: The code executed but failed with this error:
+{execution_error}"""
+                        
+                        if output_before_error:
+                            error_context += f"\n\nOutput before error:\n{output_before_error[:500]}"
+                        
+                        error_context += f"""
+
+Please analyze the error and fix the code. Common issues:
+- Column name errors: Check the data preview for exact column names
+- Data type errors: Convert types appropriately (int(), float(), str())
+- Index errors: Check data shape and bounds
+- Key errors: Ensure dictionary keys exist
+- Attribute errors: Check object has the attribute
+
+Provide ONLY the corrected Python code in a ```python code block."""
+                        
+                        conversation_history.append({"role": "assistant", "content": f"```python\n{csv_code}\n```"})
+                        conversation_history.append({"role": "user", "content": error_context})
+                        retry_count += 1
+                        continue
+                    
+                    # Success!
+                    print(f"✓ Code executed successfully on attempt {attempt_num}")
+                    execution_successful = True
+                
+                # Handle final result
+                if not execution_successful:
+                    csv_error = f"Code failed to execute successfully after {MAX_RETRIES} attempts"
+                    print(f"❌ {csv_error}")
+                    csv_execution_output.append("")
+                    csv_execution_output.append("=" * 60)
+                    csv_execution_output.append(f"FAILED AFTER {MAX_RETRIES} ATTEMPTS")
+                    csv_execution_output.append("=" * 60)
+                    csv_execution_output.append(csv_error)
+                    
                     if query_type == 'csv_only':
                         return jsonify({
                             'error': csv_error,
-                            'has_code': False
+                            'code': csv_code,
+                            'execution_output': csv_execution_output,
+                            'has_code': csv_code is not None,
+                            'error': True
                         }), 500
-                else:
-                    print(f"Generated code ({len(csv_code)} chars), validating syntax...")
-                    # Validate code syntax
-                    try:
-                        compile(csv_code, '<string>', 'exec')
-                    except SyntaxError as e:
-                        csv_error = f"Syntax error: {e.msg} on line {e.lineno}"
-                        print(f"CSV analysis error: {csv_error}")
-                        if query_type == 'csv_only':
-                            return jsonify({
-                                'response': csv_error,
-                                'code': csv_code,
-                                'has_code': True,
-                                'error': True
-                            })
-                    else:
-                        # Execute code in sandbox
-                        print("Executing code in sandbox...")
-                        execution = sbx.run_code(csv_code)
-                        
-                        if execution.error:
-                            csv_error = f"Execution error: {execution.error.name}: {execution.error.value}"
-                            print(f"CSV analysis error: {csv_error}")
-                            if query_type == 'csv_only':
-                                return jsonify({
-                                    'response': csv_error,
-                                    'code': csv_code,
-                                    'has_code': True,
-                                    'error': True
-                                })
+                
+                # If successful, continue with result processing
+                if execution_successful:
+                    print("=" * 80)
+                    print("STEP 3: Processing successful execution results...")
+                    print("=" * 80)
+                    
+                    # Capture execution results
+                    execution_has_output = False
+                    
+                    csv_execution_output.append("")
+                    csv_execution_output.append("=" * 60)
+                    csv_execution_output.append("EXECUTION RESULTS")
+                    csv_execution_output.append("=" * 60)
+                    
+                    if hasattr(execution, 'logs'):
+                        if hasattr(execution.logs, 'stdout') and execution.logs.stdout:
+                            stdout_text = ''.join(execution.logs.stdout).strip()
+                            if stdout_text:
+                                csv_execution_output.append(stdout_text)
+                                execution_has_output = True
+                                print(f"✓ Captured stdout: {len(stdout_text)} chars")
+                            else:
+                                print("⚠️ stdout is empty")
                         else:
-                            # Capture stdout/stderr
-                            if hasattr(execution, 'logs'):
-                                if hasattr(execution.logs, 'stdout') and execution.logs.stdout:
-                                    stdout_text = ''.join(execution.logs.stdout).strip()
-                                    if stdout_text:
-                                        csv_execution_output.append(stdout_text)
-                                        print(f"Captured stdout: {stdout_text[:200]}")
-                                
-                                if hasattr(execution.logs, 'stderr') and execution.logs.stderr:
-                                    stderr_text = ''.join(execution.logs.stderr).strip()
-                                    if stderr_text:
-                                        csv_execution_output.append(f"STDERR: {stderr_text}")
+                            print("⚠️ No stdout attribute")
+                        
+                        if hasattr(execution.logs, 'stderr') and execution.logs.stderr:
+                            stderr_text = ''.join(execution.logs.stderr).strip()
+                            if stderr_text:
+                                csv_execution_output.append("")
+                                csv_execution_output.append("STDERR:")
+                                csv_execution_output.append(stderr_text)
+                                execution_has_output = True
+                                print(f"✓ Captured stderr: {len(stderr_text)} chars")
+                        
+                        # Always add execution status if no output was captured
+                        if not execution_has_output:
+                            csv_execution_output.append("✓ Code executed successfully")
+                            csv_execution_output.append("(No output produced - the code may be missing print() statements)")
+                            print("⚠️ Code executed but produced no output")
+                    else:
+                        print("⚠️ Execution has no logs attribute")
+                        csv_execution_output.append("✓ Code executed")
+                        csv_execution_output.append("(Unable to capture output)")
+                    
+                    # Process results for charts
+                    # First, check for PNG results from plt.show()
+                    print(f"Checking execution.results for charts (found {len(execution.results) if execution.results else 0} results)")
+                    for idx, result in enumerate(execution.results):
+                        print(f"Result {idx}: type={type(result)}, hasattr(png)={hasattr(result, 'png')}")
+                        if hasattr(result, 'png') and result.png:
+                            print(f"Found PNG result {idx}, size: {len(result.png) if result.png else 0} bytes")
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            chart_filename = f"chart_{session_id}_{timestamp}.png"
+                            chart_path = CHARTS_DIR / chart_filename
                             
-                            # Process results for charts
-                            for result in execution.results:
-                                if hasattr(result, 'png') and result.png:
-                                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                    chart_filename = f"chart_{session_id}_{timestamp}.png"
-                                    chart_path = CHARTS_DIR / chart_filename
-                                    
-                                    with open(chart_path, 'wb') as f:
-                                        f.write(base64.b64decode(result.png))
-                                    
-                                    csv_charts.append({
-                                        'filename': chart_filename,
-                                        'url': f'/api/chart/{chart_filename}'
-                                    })
-                                    print(f"Saved chart: {chart_filename}")
+                            with open(chart_path, 'wb') as f:
+                                f.write(base64.b64decode(result.png))
                             
-                            # Generate explanation
-                            results_summary = '\n'.join(csv_execution_output) if csv_execution_output else 'Analysis completed.'
-                            print(f"Generating explanation for CSV analysis...")
+                            csv_charts.append({
+                                'filename': chart_filename,
+                                'url': f'/api/chart/{chart_filename}'
+                            })
+                            print(f"Saved chart from plt.show(): {chart_filename}")
+                        else:
+                            print(f"Result {idx} does not have PNG data")
+                    
+                    # Also check for saved chart files in sandbox (from plt.savefig)
+                    chart_paths_to_check = [
+                        '/home/user/chart.png',
+                        '/home/user/charts/chart.png',
+                        '/home/user/plot.png',
+                    ]
+                    
+                    chart_found = False
+                    for sandbox_chart_path in chart_paths_to_check:
+                        try:
+                            # Try to read file directly using sandbox files API
                             try:
-                                explanation_prompt = f"""Based on this data analysis code and results, provide a brief, clear explanation:
+                                if hasattr(sbx, 'files') and hasattr(sbx.files, 'read'):
+                                    chart_data = sbx.files.read(sandbox_chart_path)
+                                    if chart_data:
+                                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                        chart_filename = f"chart_{session_id}_{timestamp}.png"
+                                        chart_path = CHARTS_DIR / chart_filename
+                                        
+                                        with open(chart_path, 'wb') as f:
+                                            f.write(chart_data)
+                                        
+                                        csv_charts.append({
+                                            'filename': chart_filename,
+                                            'url': f'/api/chart/{chart_filename}'
+                                        })
+                                        print(f"Saved chart from sandbox file (files API): {chart_filename}")
+                                        chart_found = True
+                                        break
+                            except Exception as api_error:
+                                print(f"Files API failed for {sandbox_chart_path}: {api_error}")
+                        except Exception as e:
+                            print(f"Error checking for chart at {sandbox_chart_path}: {e}")
+                            continue
+                    
+                    if not chart_found and not csv_charts:
+                        print("No charts found in execution.results or sandbox filesystem")
+                    
+                    # Generate explanation from execution results
+                    results_summary = '\n'.join(csv_execution_output) if csv_execution_output else 'Code executed successfully.'
+                    print(f"Generating explanation for CSV analysis...")
+                    
+                    if execution_has_output:
+                        # Generate explanation from actual results
+                        try:
+                            explanation_prompt = f"""Based on this data analysis code and results, provide a clear, direct answer to the user's question:
+
+User question: {message}
 
 Code executed:
 {csv_code}
 
-Results:
-{results_summary}
+Execution results:
+{results_summary[:2000]}
 
-Provide a concise 2-3 sentence explanation of the analysis and findings."""
+Provide a clear, direct answer to the user's question based on the results. If the results contain the answer, state it clearly. If not, explain what was found."""
 
-                                explanation_response = groq_client.chat.completions.create(
-                                    model="qwen/qwen3-32b",
-                                    messages=[
-                                        {"role": "system", "content": "You are a data analysis expert. Explain results clearly and concisely."},
-                                        {"role": "user", "content": explanation_prompt}
-                                    ],
-                                    temperature=0.3,
-                                    max_tokens=512
-                                )
-                                csv_analysis_result = explanation_response.choices[0].message.content
-                                print(f"CSV analysis completed successfully")
-                            except Exception as e:
-                                print(f"Error generating explanation: {e}")
-                                csv_analysis_result = f"Analysis completed. Results:\n{results_summary[:500]}"
+                            explanation_response = groq_client.chat.completions.create(
+                                model="qwen/qwen3-32b",
+                                messages=[
+                                    {"role": "system", "content": "You are a data analysis expert. Answer questions directly based on the analysis results."},
+                                    {"role": "user", "content": explanation_prompt}
+                                ],
+                                temperature=0.3,
+                                max_tokens=1024
+                            )
+                            csv_analysis_result = explanation_response.choices[0].message.content
+                            print(f"CSV analysis completed successfully")
+                        except Exception as e:
+                            print(f"Error generating explanation: {e}")
+                            csv_analysis_result = f"Analysis completed. Results:\n{results_summary[:1000]}"
+                    else:
+                        csv_analysis_result = f"Code executed successfully after {retry_count + 1} attempt(s)."
+                
             except Exception as e:
                 csv_error = f"CSV analysis failed: {str(e)}"
                 print(f"CSV analysis error: {csv_error}")
@@ -816,6 +2008,19 @@ Provide a concise 2-3 sentence explanation of the analysis and findings."""
                     }), 500
         
         # Combine results based on query type
+        if query_type == 'document_search':
+            if not document_search_result:
+                return jsonify({
+                    'response': f'Document search completed but no results were returned. {document_search_error or "Please try rephrasing your query."}',
+                    'has_documents': False,
+                    'error': document_search_error
+                })
+            return jsonify({
+                'response': document_search_result,
+                'has_documents': True,
+                'has_code': False
+            })
+        
         if query_type == 'web_search_only':
             if not web_research_result:
                 return jsonify({
@@ -830,6 +2035,20 @@ Provide a concise 2-3 sentence explanation of the analysis and findings."""
             })
         
         elif query_type == 'csv_only':
+            print("=" * 80)
+            print("FINAL RESPONSE FOR CSV_ONLY")
+            print("=" * 80)
+            print(f"  - Response length: {len(csv_analysis_result) if csv_analysis_result else 0}")
+            print(f"  - Has code: {csv_code is not None}")
+            print(f"  - Code length: {len(csv_code) if csv_code else 0}")
+            print(f"  - Execution output items: {len(csv_execution_output)}")
+            print(f"  - Charts: {len(csv_charts)}")
+            if csv_execution_output:
+                print("  - Execution output preview:")
+                for i, item in enumerate(csv_execution_output[:3]):
+                    print(f"    [{i}]: {item[:100]}")
+            print("=" * 80)
+            
             return jsonify({
                 'response': csv_analysis_result or "Analysis completed.",
                 'code': csv_code,
@@ -959,31 +2178,64 @@ def extract_code_from_response(text):
     """Extract Python code from markdown code blocks and fix indentation"""
     import re
     
+    print(f"Attempting to extract code from response (length: {len(text)} chars)")
+    print(f"Response preview: {text[:200]}...")
+    
     # Try to find code block with python marker
-    pattern = r'```python\n(.*?)```'
+    pattern = r'```python\s*\n(.*?)```'
     matches = re.findall(pattern, text, re.DOTALL)
     if matches:
         code = matches[0].strip()
+        print(f"✓ Found Python code block (method 1): {len(code)} chars")
         # Fix indentation
         code = fix_code_indentation(code)
         return code
     
     # Try to find any code block
-    pattern = r'```\n(.*?)```'
+    pattern = r'```\s*\n(.*?)```'
     matches = re.findall(pattern, text, re.DOTALL)
     if matches:
         code = matches[0].strip()
+        print(f"✓ Found generic code block (method 2): {len(code)} chars")
         # Fix indentation
         code = fix_code_indentation(code)
         return code
     
+    # Try without newline after opening backticks
+    pattern = r'```python(.*?)```'
+    matches = re.findall(pattern, text, re.DOTALL)
+    if matches:
+        code = matches[0].strip()
+        print(f"✓ Found Python code block without newline (method 3): {len(code)} chars")
+        code = fix_code_indentation(code)
+        return code
+    
+    # Try generic without newline
+    pattern = r'```(.*?)```'
+    matches = re.findall(pattern, text, re.DOTALL)
+    if matches:
+        code = matches[0].strip()
+        print(f"✓ Found generic code block without newline (method 4): {len(code)} chars")
+        code = fix_code_indentation(code)
+        return code
+    
     # If no code blocks, check if entire response looks like code
-    if 'import' in text and ('pandas' in text or 'matplotlib' in text):
+    if 'import' in text and ('pandas' in text or 'matplotlib' in text or 'pd.' in text or 'plt.' in text):
+        print(f"✓ Response appears to be raw Python code (method 5)")
         code = text.strip()
         # Fix indentation
         code = fix_code_indentation(code)
         return code
     
+    # Last resort: if it has df. or pd. operations, assume it's code
+    if ('df.' in text or 'pd.' in text) and len(text.split('\n')) > 2:
+        print(f"⚠️ Response contains pandas operations, treating as code (method 6)")
+        code = text.strip()
+        code = fix_code_indentation(code)
+        return code
+    
+    print(f"❌ Could not extract code from response. Response content:")
+    print(text[:500])
     return None
 
 @app.route('/api/research', methods=['POST'])
@@ -1028,12 +2280,6 @@ def research():
         else:
             research_sandbox = research_sandboxes[session_id]
         
-        # Create OpenAI-compatible client for Groq
-        groq_openai_client = OpenAI(
-            api_key=os.getenv('GROQ_API_KEY'),
-            base_url='https://api.groq.com/openai/v1'
-        )
-        
         # Get MCP URL and token (try different method names for Python SDK)
         try:
             # Try Python SDK method names (snake_case)
@@ -1074,7 +2320,7 @@ Provide a detailed summary with sources and key findings."""
             print("Calling Groq with MCP tools...")
             # Try using chat.completions with MCP tools
             # Note: Groq may need to support MCP tools format
-            response = groq_openai_client.chat.completions.create(
+            response = groq_client.chat.completions.create(
                 model="qwen/qwen3-32b",  # Using the same model as CSV analysis
                 messages=[
                     {
