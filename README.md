@@ -10,6 +10,9 @@ An intelligent AI assistant that analyzes CSV files using **Gemini AI** for natu
 - 🐍 **Python Code Execution**: AI generates and executes Python code in E2B sandbox
 - 📈 **Automatic Visualizations**: Creates charts and graphs using matplotlib
 - 🔍 **Deep Web Research**: Use E2B MCP sandbox with Exa for comprehensive web research
+- 🏢 **Competitor Analysis**: Upload company data, discover competitors, and generate competitive comparisons
+- 🌐 **Web Scraping**: Scrape competitor websites using Browserbase MCP in E2B sandboxes
+- 📋 **Comparison Tables**: Side-by-side feature and pricing comparisons with AI insights
 - 🎨 **Modern UI**: Beautiful, responsive React frontend
 - 🔒 **Secure**: Code runs in isolated E2B sandboxes
 
@@ -21,6 +24,8 @@ An intelligent AI assistant that analyzes CSV files using **Gemini AI** for natu
 - Node.js 16+
 - E2B API Key ([Get one here](https://e2b.dev/))
 - Groq API Key ([Get one here](https://console.groq.com/))
+- Exa API Key ([Get one here](https://exa.ai/)) - For web research and competitor discovery
+- Browserbase API Key ([Get one here](https://browserbase.com/)) - For competitor website scraping
 
 ### Installation
 
@@ -47,10 +52,15 @@ Create a `.env` file in the root directory:
 ```bash
 E2B_API_KEY=your_e2b_api_key_here
 GROQ_API_KEY=your_groq_api_key_here
-EXA_API_KEY=your_exa_api_key_here  # Optional: For web research feature
+EXA_API_KEY=your_exa_api_key_here  # For web research and competitor discovery
+BROWSERBASE_API_KEY=your_browserbase_api_key_here  # For competitor website scraping
+BROWSERBASE_PROJECT_ID=your_browserbase_project_id_here
 ```
 
-**Note**: The `EXA_API_KEY` is optional and only needed if you want to use the web research feature. Get your Exa API key from [Exa AI](https://exa.ai/).
+**Note**: 
+- `EXA_API_KEY` is required for competitor discovery and web research features
+- `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID` are required for competitor website scraping
+- See `.env.example` for a complete template
 
 3. **Install frontend dependencies**
 
@@ -148,10 +158,21 @@ e2b_hackathon/
 
 ## 🔧 API Endpoints
 
-- `POST /api/upload` - Upload CSV file
-- `POST /api/chat` - Send analysis query
+### Data Analysis
+- `POST /api/upload` - Upload CSV/JSON file (supports company data schema)
+- `POST /api/chat` - Send analysis query (supports competitor analysis queries)
 - `GET /api/chart/<filename>` - Retrieve generated charts
 - `POST /api/session/close` - Close sandbox session
+
+### Web Research
+- `POST /api/research` - Perform web research using Exa MCP
+
+### Competitor Analysis
+- `POST /api/competitor/discover` - Discover competitors using Exa
+- `POST /api/competitor/scrape` - Scrape competitor website using Browserbase MCP
+- `POST /api/competitor/compare` - Generate competitive comparison table
+
+### System
 - `GET /api/health` - Health check
 
 ## 💡 Example Queries
@@ -181,7 +202,7 @@ e2b_hackathon/
 
 ## 🔍 Web Research Feature
 
-The application now supports deep web research using E2B MCP (Model Context Protocol) sandboxes with Exa for web search.
+The application supports deep web research using E2B MCP (Model Context Protocol) sandboxes with Exa for web search.
 
 ### Setup
 
@@ -206,7 +227,7 @@ curl -X POST http://localhost:5000/api/research \
 
 The research endpoint:
 - Creates an E2B sandbox with Exa MCP server enabled
-- Uses Groq AI (moonshotai/kimi-k2-instruct-0905) with MCP tools
+- Uses Groq AI with MCP tools
 - Performs comprehensive web searches using Exa
 - Returns detailed research results with sources
 
@@ -215,6 +236,95 @@ The research endpoint:
 - "What are the latest developments in quantum computing?"
 - "Find recent research papers about large language models"
 - "What happened in the tech industry this month?"
+
+## 🏢 Competitor Analysis Feature
+
+Analyze your company against competitors with automated discovery, web scraping, and AI-powered insights.
+
+### Company Data Schema
+
+Upload a CSV or JSON file with your company information:
+
+```json
+{
+  "company_name": "Your Company",
+  "industry": "SaaS",
+  "description": "Brief description of what you do",
+  "website": "https://yourcompany.com",
+  "features": [
+    {"name": "Feature 1", "description": "Description", "category": "Core"},
+    {"name": "Feature 2", "description": "Description", "category": "Premium"}
+  ],
+  "pricing": {
+    "tiers": [
+      {
+        "name": "Starter",
+        "price": "$49",
+        "billing_period": "monthly",
+        "features": ["Feature 1", "Feature 2"]
+      }
+    ]
+  }
+}
+```
+
+### Workflow
+
+1. **Upload Company Data**
+   ```bash
+   curl -X POST http://localhost:5000/api/upload \
+     -F "file=@company_data.json" \
+     -F "session_id=my_session"
+   ```
+
+2. **Discover Competitors**
+   ```bash
+   curl -X POST http://localhost:5000/api/competitor/discover \
+     -H "Content-Type: application/json" \
+     -d '{"session_id": "my_session"}'
+   ```
+
+3. **Scrape Competitor Website**
+   ```bash
+   curl -X POST http://localhost:5000/api/competitor/scrape \
+     -H "Content-Type: application/json" \
+     -d '{
+       "session_id": "my_session",
+       "url": "https://competitor.com"
+     }'
+   ```
+
+4. **Generate Comparison**
+   ```bash
+   curl -X POST http://localhost:5000/api/competitor/compare \
+     -H "Content-Type: application/json" \
+     -d '{"session_id": "my_session"}'
+   ```
+
+### Natural Language Queries
+
+You can also use the chat interface with natural language:
+
+- **"Find competitors"** - Automatically discovers competitors in your industry
+- **"Compare with competitors"** - Generates a comprehensive comparison table
+- **"What are my competitive advantages?"** - Shows features unique to your company
+- **"What features am I missing?"** - Identifies gaps compared to competitors
+
+### How It Works
+
+1. **Company Data Validation**: Validates uploaded data against company schema
+2. **Competitor Discovery**: Uses Exa MCP to find competitors based on industry and company description
+3. **Web Scraping**: Uses Browserbase MCP in E2B sandboxes to scrape competitor websites
+4. **Data Extraction**: Uses Groq AI to extract structured pricing and features from HTML
+5. **Comparison Generation**: Creates side-by-side comparisons with AI-powered insights
+
+### Features
+
+- ✅ **Automated Discovery**: Find competitors automatically using Exa
+- 🌐 **Secure Scraping**: All scraping happens in isolated E2B sandboxes
+- 🤖 **AI Extraction**: Groq AI extracts structured data from unstructured HTML
+- 📊 **Smart Comparisons**: Identifies advantages, gaps, and strategic opportunities
+- 💡 **Strategic Insights**: AI-generated recommendations based on competitive landscape
 
 ## 📝 License
 

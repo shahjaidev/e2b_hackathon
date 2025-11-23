@@ -14,6 +14,9 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
+# Export environment variables from .env
+export $(cat .env | grep -v '^#' | xargs)
+
 # Install/update dependencies
 echo "Installing dependencies..."
 pip install -r requirements.txt

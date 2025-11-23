@@ -6,7 +6,8 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [inputMessage, setInputMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [uploadedFile, setUploadedFile] = useState(null);
+  const [uploadedFiles, setUploadedFiles] = useState([]); // Changed to array
+  const [activeFileIndex, setActiveFileIndex] = useState(0); // Track which file is active
   const [sessionId] = useState(() => `session_${Date.now()}`);
   const [isDragging, setIsDragging] = useState(false);
   const messagesEndRef = useRef(null);
@@ -21,47 +22,103 @@ function App() {
   }, [messages]);
 
   const handleFileUpload = async (file) => {
-    if (!file) return;
+    if (!file) {
+      console.log('No file provided');
+      return;
+    }
 
+    console.log('Uploading file:', file.name);
     const formData = new FormData();
     formData.append('file', file);
     formData.append('session_id', sessionId);
 
     setIsLoading(true);
     try {
+      console.log('Sending upload request to /api/upload');
       const response = await axios.post('/api/upload', formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
       });
 
-      // Store session_id with the uploaded file data (use the one from response if available)
+      console.log('Upload response:', response.data);
+
+      // Store session_id with the uploaded file data
       const fileData = { 
         ...response.data, 
-        session_id: response.data.session_id || sessionId 
+        session_id: response.data.session_id || sessionId,
+        uploadedAt: new Date().toISOString()
       };
-      setUploadedFile(fileData);
+      
+      console.log('Adding file to uploadedFiles array, current length:', uploadedFiles.length);
+      
+      // Add to uploaded files array and update active index
+      setUploadedFiles(prev => {
+        const newFiles = [...prev, fileData];
+        console.log('New files array length:', newFiles.length);
+        // Set the newly added file as active
+        setActiveFileIndex(newFiles.length - 1);
+        return newFiles;
+      });
+      
       console.log('File uploaded with session_id:', fileData.session_id);
-      setMessages([
+      
+      // Create upload message
+      let uploadMessage = `File "${response.data.filename}" uploaded successfully.\n\n`;
+      
+      // Check if it's company data
+      if (response.data.is_company_data) {
+        const summary = response.data.company_summary;
+        uploadMessage += `📊 Company Data Detected!\n`;
+        uploadMessage += `Company: ${summary.company_name}\n`;
+        uploadMessage += `Industry: ${summary.industry}\n`;
+        if (summary.has_financials) {
+          uploadMessage += `Type: ${summary.data_type}\n`;
+          uploadMessage += `Financial Columns: ${summary.financial_columns?.join(', ')}\n`;
+        } else {
+          uploadMessage += `Features: ${summary.features_count}\n`;
+          uploadMessage += `Pricing Tiers: ${summary.pricing_tiers_count}\n`;
+        }
+        uploadMessage += `\nYou can now:\n`;
+        uploadMessage += `- Ask questions about your data\n`;
+        uploadMessage += `- Find competitors\n`;
+        uploadMessage += `- Compare with competitors`;
+      } else {
+        uploadMessage += `Dataset info:\n`;
+        uploadMessage += `Rows: ${response.data.columns_info?.shape?.[0] || 'N/A'}\n`;
+        uploadMessage += `Columns: ${response.data.columns_info?.shape?.[1] || 'N/A'}\n`;
+        uploadMessage += `Column names: ${response.data.columns_info?.columns?.join(', ') || 'N/A'}\n\n`;
+        uploadMessage += `You can now ask questions about your data.`;
+      }
+      
+      setMessages(prev => [
+        ...prev,
         {
           type: 'system',
-          content: `File "${response.data.filename}" uploaded successfully.
-
-Dataset info:
-Rows: ${response.data.columns_info?.shape?.[0] || 'N/A'}
-Columns: ${response.data.columns_info?.shape?.[1] || 'N/A'}
-Column names: ${response.data.columns_info?.columns?.join(', ') || 'N/A'}
-
-You can now ask questions about your data.`,
+          content: uploadMessage,
         },
       ]);
     } catch (error) {
-      setMessages([
+      console.error('Upload error:', error);
+      console.error('Error response:', error.response);
+      setMessages(prev => [
+        ...prev,
         {
           type: 'error',
           content: `Error uploading file: ${error.response?.data?.error || error.message}`,
         },
       ]);
+      // Still add a placeholder to uploadedFiles so UI transitions
+      setUploadedFiles(prev => {
+        const errorFile = {
+          filename: file.name,
+          error: true,
+          session_id: sessionId
+        };
+        const newFiles = [...prev, errorFile];
+        setActiveFileIndex(newFiles.length - 1);
+        return newFiles;
+      });
     } finally {
       setIsLoading(false);
     }
@@ -81,26 +138,42 @@ You can now ask questions about your data.`,
     e.preventDefault();
     setIsDragging(false);
     
-    const file = e.dataTransfer.files[0];
-    if (file && file.name.endsWith('.csv')) {
-      handleFileUpload(file);
+    const files = Array.from(e.dataTransfer.files);
+    const validFiles = files.filter(file => 
+      file.name.endsWith('.csv') || 
+      file.name.endsWith('.json') || 
+      file.name.endsWith('.xlsx') || 
+      file.name.endsWith('.xls') ||
+      file.name.endsWith('.pdf')
+    );
+    
+    if (validFiles.length > 0) {
+      // Upload files sequentially
+      validFiles.forEach(file => handleFileUpload(file));
     } else {
-      alert('Please upload a CSV file');
+      alert('Please upload CSV, JSON, Excel, or PDF files');
     }
   };
 
   const handleFileInputChange = (e) => {
-    const file = e.target.files[0];
-    if (file) {
-      handleFileUpload(file);
+    console.log('File input changed, files:', e.target.files);
+    const files = Array.from(e.target.files);
+    console.log('Files array:', files.length, 'files');
+    if (files.length === 0) {
+      console.log('No files selected');
+      return;
     }
+    files.forEach(file => {
+      console.log('Processing file:', file.name);
+      handleFileUpload(file);
+    });
   };
 
   const handleSendMessage = async (e) => {
     e.preventDefault();
     if (!inputMessage.trim() || isLoading) return;
-    if (!uploadedFile) {
-      alert('Please upload a CSV file first');
+    if (uploadedFiles.length === 0) {
+      alert('Please upload at least one file first');
       return;
     }
 
@@ -110,8 +183,9 @@ You can now ask questions about your data.`,
     setIsLoading(true);
 
     try {
-      // Use the session_id from uploadedFile if available, otherwise use the component's sessionId
-      const activeSessionId = uploadedFile?.session_id || sessionId;
+      // Use the session_id from active file
+      const activeFile = uploadedFiles[activeFileIndex];
+      const activeSessionId = activeFile?.session_id || sessionId;
       console.log('Sending chat request with session_id:', activeSessionId);
       const response = await axios.post('/api/chat', {
         message: userMessage,
@@ -125,32 +199,21 @@ You can now ask questions about your data.`,
         charts: response.data.charts,
         execution_output: response.data.execution_output,
         error: response.data.error,
+        competitors: response.data.competitors,
+        comparison: response.data.comparison,
       };
 
       setMessages((prev) => [...prev, botMessage]);
     } catch (error) {
       const errorMessage = error.response?.data?.error || error.message;
       
-      // If the error is about missing file, try to re-upload
-      if (errorMessage.includes('upload a CSV file first') && uploadedFile) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            type: 'error',
-            content: `Session expired. Please re-upload your file.`,
-          },
-        ]);
-        // Optionally auto-clear the uploaded file state
-        // setUploadedFile(null);
-      } else {
-        setMessages((prev) => [
-          ...prev,
-          {
-            type: 'error',
-            content: `Error: ${errorMessage}`,
-          },
-        ]);
-      }
+      setMessages((prev) => [
+        ...prev,
+        {
+          type: 'error',
+          content: `Error: ${errorMessage}`,
+        },
+      ]);
     } finally {
       setIsLoading(false);
     }
@@ -163,6 +226,11 @@ You can now ask questions about your data.`,
     "Show the top 10 rows by the first numerical column",
   ];
 
+  // Debug: Log uploadedFiles state
+  useEffect(() => {
+    console.log('uploadedFiles state changed:', uploadedFiles.length, 'files');
+  }, [uploadedFiles]);
+
   return (
     <div className="App">
       <div className="container">
@@ -171,7 +239,7 @@ You can now ask questions about your data.`,
           <p>Upload your CSV and ask questions — powered by Groq & E2B</p>
         </header>
 
-        {!uploadedFile ? (
+        {uploadedFiles.length === 0 ? (
           <div
             className={`upload-area ${isDragging ? 'dragging' : ''}`}
             onDragOver={handleDragOver}
@@ -186,39 +254,75 @@ You can now ask questions about your data.`,
                 <line x1="12" y1="3" x2="12" y2="15"></line>
               </svg>
             </div>
-            <h2>Upload Your CSV File</h2>
-            <p>Drag and drop or click to browse</p>
+            <h2>Upload Your Files</h2>
+            <p>Drag and drop multiple files or click to browse</p>
+            <p className="file-types">Supports: CSV, JSON, Excel (.xlsx, .xls), PDF</p>
             <input
               ref={fileInputRef}
               type="file"
-              accept=".csv"
+              accept=".csv,.json,.xlsx,.xls,.pdf"
+              multiple
               onChange={handleFileInputChange}
               style={{ display: 'none' }}
             />
           </div>
         ) : (
           <div className="chat-container">
-            <div className="file-info">
-              <span className="file-icon">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                  <polyline points="14 2 14 8 20 8"></polyline>
-                  <line x1="16" y1="13" x2="8" y2="13"></line>
-                  <line x1="16" y1="17" x2="8" y2="17"></line>
-                  <polyline points="10 9 9 9 8 9"></polyline>
-                </svg>
-              </span>
-              <span className="file-name">{uploadedFile.filename}</span>
-              <button
-                className="change-file-btn"
-                onClick={() => {
-                  setUploadedFile(null);
-                  setMessages([]);
-                  fileInputRef.current?.click();
-                }}
-              >
-                Change File
-              </button>
+            <div className="files-section">
+              <div className="files-header">
+                <h3>Uploaded Files ({uploadedFiles.length})</h3>
+                <button
+                  className="add-file-btn"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  + Add More Files
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".csv,.json,.xlsx,.xls,.pdf"
+                  multiple
+                  onChange={handleFileInputChange}
+                  style={{ display: 'none' }}
+                />
+              </div>
+              <div className="files-list">
+                {uploadedFiles.map((file, index) => (
+                  <div
+                    key={index}
+                    className={`file-item ${index === activeFileIndex ? 'active' : ''}`}
+                    onClick={() => setActiveFileIndex(index)}
+                  >
+                    <span className="file-icon">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                      </svg>
+                    </span>
+                    <div className="file-details">
+                      <span className="file-name">{file.filename}</span>
+                      {file.is_company_data && (
+                        <span className="file-badge">Company Data</span>
+                      )}
+                      {file.company_summary?.has_financials && (
+                        <span className="file-badge financial">Financial Data</span>
+                      )}
+                    </div>
+                    <button
+                      className="remove-file-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setUploadedFiles(prev => prev.filter((_, i) => i !== index));
+                        if (activeFileIndex >= uploadedFiles.length - 1) {
+                          setActiveFileIndex(Math.max(0, uploadedFiles.length - 2));
+                        }
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
             </div>
 
             <div className="messages">
