@@ -358,42 +358,116 @@ const Page = () => {
 
             const result = await response.json()
 
-            // Update conversation with document info
-            setConversations((prev) =>
-                prev.map((conv) =>
-                    conv.id === currentConversationId
-                        ? {
-                              ...conv,
-                              downloadedDocuments: [
-                                  ...(conv.downloadedDocuments || []),
-                                  {
-                                      filename: result.filename,
-                                      url: driveUrl,
-                                  },
-                              ],
-                          }
-                        : conv
-                )
-            )
-
-            // Add a system message about the download
-            const downloadMessage: Message = {
-                id: `${Date.now()}-download-${Math.random().toString(36).substring(2, 9)}`,
-                role: 'assistant',
-                content: `Document "${result.filename}" downloaded from Google Drive successfully. You can now ask questions about the document content.`,
-                type: 'system',
+            // Show PDF parsing status if PDFs were parsed
+            if (result.pdf_parsing && result.pdf_parsing.total > 0) {
+                const { total, parsed, failed } = result.pdf_parsing
+                if (parsed > 0) {
+                    setStatus(`✅ Parsed ${parsed}/${total} PDFs successfully`)
+                }
+                if (failed > 0) {
+                    setStatus(`⚠️ ${failed}/${total} PDFs failed to parse (will use fallback)`)
+                }
             }
 
-            setConversations((prev) =>
-                prev.map((conv) =>
-                    conv.id === currentConversationId
-                        ? {
-                              ...conv,
-                              messages: [...conv.messages, downloadMessage],
-                          }
-                        : conv
+            // Handle folder download (multiple files)
+            if (result.type === 'folder' && result.files) {
+                // Update conversation with all documents from folder
+                const folderDocs = result.files.map((file: any) => ({
+                    filename: file.filename,
+                    url: driveUrl,
+                }))
+                
+                setConversations((prev) =>
+                    prev.map((conv) =>
+                        conv.id === currentConversationId
+                            ? {
+                                  ...conv,
+                                  downloadedDocuments: [
+                                      ...(conv.downloadedDocuments || []),
+                                      ...folderDocs,
+                                  ],
+                              }
+                            : conv
+                    )
                 )
-            )
+
+                // Build parsing status message
+                let parsingMessage = ''
+                if (result.pdf_parsing && result.pdf_parsing.total > 0) {
+                    const { total, parsed, failed } = result.pdf_parsing
+                    parsingMessage = `\n\n📄 PDF Parsing: ${parsed}/${total} successful`
+                    if (failed > 0) {
+                        parsingMessage += ` (${failed} failed)`
+                    }
+                }
+
+                // Add a system message about the download
+                const downloadMessage: Message = {
+                    id: `${Date.now()}-download-${Math.random().toString(36).substring(2, 9)}`,
+                    role: 'assistant',
+                    content: `Downloaded ${result.count} files from Google Drive folder successfully:\n${result.files.map((f: any) => `• ${f.filename}${f.is_pdf ? ' (PDF - auto-parsed for search)' : ''}`).join('\n')}${parsingMessage}\n\nYou can now ask questions about the document contents.`,
+                    type: 'system',
+                }
+
+                setConversations((prev) =>
+                    prev.map((conv) =>
+                        conv.id === currentConversationId
+                            ? {
+                                  ...conv,
+                                  messages: [...conv.messages, downloadMessage],
+                              }
+                            : conv
+                    )
+                )
+            } else {
+                // Handle single file download
+                setConversations((prev) =>
+                    prev.map((conv) =>
+                        conv.id === currentConversationId
+                            ? {
+                                  ...conv,
+                                  downloadedDocuments: [
+                                      ...(conv.downloadedDocuments || []),
+                                      {
+                                          filename: result.filename,
+                                          url: driveUrl,
+                                      },
+                                  ],
+                              }
+                            : conv
+                    )
+                )
+
+                // Build parsing status message
+                let parsingMessage = ''
+                if (result.pdf_parsing && result.pdf_parsing.total > 0) {
+                    const { parsed, failed } = result.pdf_parsing
+                    if (parsed > 0) {
+                        parsingMessage = '\n\n✅ PDF automatically parsed and ready for semantic search!'
+                    } else if (failed > 0) {
+                        parsingMessage = '\n\n⚠️ PDF parsing failed, using fallback text extraction'
+                    }
+                }
+
+                // Add a system message about the download
+                const downloadMessage: Message = {
+                    id: `${Date.now()}-download-${Math.random().toString(36).substring(2, 9)}`,
+                    role: 'assistant',
+                    content: `Document "${result.filename}" downloaded from Google Drive successfully.${parsingMessage}\n\nYou can now ask questions about the document content.`,
+                    type: 'system',
+                }
+
+                setConversations((prev) =>
+                    prev.map((conv) =>
+                        conv.id === currentConversationId
+                            ? {
+                                  ...conv,
+                                  messages: [...conv.messages, downloadMessage],
+                              }
+                            : conv
+                    )
+                )
+            }
 
             setDriveUrl('')
             setStatus(null)
@@ -420,8 +494,6 @@ const Page = () => {
                         : conv
                 )
             )
-
-            setTimeout(() => setStatus(null), 5000)
         } finally {
             setDownloadingDrive(false)
         }
@@ -730,18 +802,23 @@ const Page = () => {
                                         {currentConversation.downloadedDocuments &&
                                             currentConversation.downloadedDocuments.length >
                                                 0 && (
-                                                <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-                                                    <span>Documents:</span>
-                                                    {currentConversation.downloadedDocuments.map(
-                                                        (doc, idx) => (
-                                                            <span
-                                                                key={idx}
-                                                                className="px-2 py-1 bg-muted rounded"
-                                                            >
-                                                                📄 {doc.filename}
-                                                            </span>
-                                                        )
-                                                    )}
+                                                <div className="space-y-2">
+                                                    <div className="text-sm font-medium text-foreground">
+                                                        Downloaded Documents ({currentConversation.downloadedDocuments.length}):
+                                                    </div>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {currentConversation.downloadedDocuments.map(
+                                                            (doc, idx) => (
+                                                                <span
+                                                                    key={idx}
+                                                                    className="px-3 py-1.5 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 rounded-md text-sm border border-blue-200 dark:border-blue-800 flex items-center gap-2"
+                                                                    title={doc.url}
+                                                                >
+                                                                    📄 {doc.filename}
+                                                                </span>
+                                                            )
+                                                        )}
+                                                    </div>
                                                 </div>
                                             )}
                                     </div>

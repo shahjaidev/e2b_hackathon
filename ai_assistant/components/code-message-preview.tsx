@@ -44,11 +44,11 @@ const CodeMessagePreview = ({ message, fragment, toggleCode }: CodeMessagePrevie
                 className="bg-secondary hover:bg-secondary/90 cursor-pointer rounded-lg p-4 max-w-[80%] w-full space-y-2"
                 onClick={toggleCode}
             >
-                <div className="flex items-center gap-2 text-sm font-medium">
+                <div className="flex items-center gap-2 text-sm font-medium text-gray-900 dark:text-gray-100">
                     <FileCode className="h-4 w-4" />
                     <span>{fragment?.file_path || 'analysis.py'}</span>
                 </div>
-                <div className="text-sm text-muted-foreground font-mono overflow-hidden rounded bg-secondary/50">
+                <div className="text-sm font-mono overflow-hidden rounded bg-secondary/50">
                     {codeContent ? (
                         <>
                             <SyntaxHighlighter
@@ -64,7 +64,7 @@ const CodeMessagePreview = ({ message, fragment, toggleCode }: CodeMessagePrevie
                                 {previewContent}
                             </SyntaxHighlighter>
                             {remainingLines > 0 && (
-                                <div className="text-xs text-muted-foreground mt-1 pl-2 pb-1">
+                                <div className="text-xs text-gray-700 dark:text-gray-300 mt-1 pl-2 pb-1">
                                     {remainingLines} more lines
                                 </div>
                             )}

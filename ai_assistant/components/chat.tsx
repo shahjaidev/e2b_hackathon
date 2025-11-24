@@ -71,7 +71,7 @@ export function Chat({
             if (message.type === 'system') {
                 return (
                     <div key={messageKey} className="flex justify-center mb-4">
-                        <div className="bg-muted/50 rounded-lg p-3 max-w-[80%] text-sm text-muted-foreground">
+                        <div className="bg-muted/50 rounded-lg p-3 max-w-[80%] text-sm text-gray-700 dark:text-gray-300">
                             {message.content}
                         </div>
                     </div>
@@ -85,7 +85,7 @@ export function Chat({
                             <div className="text-destructive font-medium mb-1">
                                 Error
                             </div>
-                            <div className="text-sm">{message.content}</div>
+                            <div className="text-sm text-gray-900 dark:text-gray-100">{message.content}</div>
                         </div>
                     </div>
                 )
@@ -129,18 +129,18 @@ export function Chat({
                         )}
                         {message.executionOutput && message.executionOutput.length > 0 && (
                             <div className="bg-muted rounded-lg p-4 max-w-[80%] border border-border">
-                                <div className="text-xs font-semibold text-foreground mb-2 flex items-center gap-2">
+                                <div className="text-xs font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
                                     <span className="h-2 w-2 rounded-full bg-green-500"></span>
                                     Execution Output:
                                 </div>
-                                <pre className="text-xs font-mono whitespace-pre-wrap break-words">
+                                <pre className="text-xs font-mono whitespace-pre-wrap break-words text-gray-900 dark:text-gray-100">
                                     {message.executionOutput.join('\n')}
                                 </pre>
                             </div>
                         )}
                         {message.type === 'code' && (!message.executionOutput || message.executionOutput.length === 0) && (
                             <div className="bg-muted/50 rounded-lg p-3 max-w-[80%] border border-dashed border-muted-foreground/30">
-                                <div className="text-xs text-muted-foreground">
+                                <div className="text-xs text-gray-700 dark:text-gray-300">
                                     ⏳ Code execution in progress or no output produced...
                                 </div>
                             </div>
@@ -153,7 +153,7 @@ export function Chat({
             return (
                 <div key={messageKey} className="space-y-2 mb-4">
                     <div className="flex mb-4">
-                        <div className="bg-muted rounded-lg p-4 max-w-[80%]">
+                        <div className="bg-muted rounded-lg p-4 max-w-[80%] text-gray-900 dark:text-gray-100">
                             <MarkdownContent content={message.content} />
                         </div>
                     </div>
@@ -189,7 +189,7 @@ export function Chat({
                             <div className="bg-muted rounded-lg p-4 max-w-[80%]">
                                 <div className="flex items-center gap-2">
                                     <div className="h-4 w-4 rounded-full bg-secondary animate-pulse" />
-                                    <div className="text-sm text-muted-foreground">
+                                    <div className="text-sm text-gray-700 dark:text-gray-300">
                                         {status || 'Processing...'}
                                     </div>
                                 </div>
